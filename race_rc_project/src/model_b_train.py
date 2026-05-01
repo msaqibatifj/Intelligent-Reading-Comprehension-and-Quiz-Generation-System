@@ -1,190 +1,246 @@
+"""Model B Training Script - Distractor & Hint Generation
+Local training pipeline for distractor and hint generation on RACE dataset
+Usage: python src/model_b_train.py
 """
-Model B Training Script: Distractor & Hint Generator
-Trains models for plausible distractor generation and graduated hint extraction.
 
-Run this locally or as a Kaggle notebook cell.
-"""
+import os
+import time
 import pandas as pd
 import numpy as np
+import string
 from pathlib import Path
 import joblib
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, mean_squared_error, r2_score
-)
-from gensim.models import Word2Vec
-from nltk.tokenize import word_tokenize, sent_tokenize
-import nltk
 
+# NLP imports
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+from gensim.models import Word2Vec
+
+# ML imports
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix, hstack
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Download NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
-from src.preprocessing import FeatureEngineer, prepare_distractor_dataset, build_feature_matrix_model_b
-from src.evaluate import ModelBEvaluator
-
-# ============================================================================
-# Configuration
-# ============================================================================
-CONFIG = {
-    'data_path': 'data/raw/train.csv',  # Update with your RACE CSV path
-    'test_size': 0.2,
-    'random_state': 42,
-    'max_features': 5000,
-    'models_output_dir': 'models/model_b/traditional/',
-    'word2vec_window': 5,
-    'word2vec_min_count': 2,
-    'word2vec_workers': 4,
-}
-
+print("✓ All imports successful")
 
 # ============================================================================
-# Model Training Functions
+# Distractor & Hint Generator Class
 # ============================================================================
 
-def train_word2vec_embeddings(texts, output_path):
-    """Train Word2Vec embeddings on corpus."""
-    print("\n[Model B] Training Word2Vec embeddings...")
+class DistractorHintGenerator:
+    """Generate distractors and hints for quiz questions."""
     
-    # Tokenize texts
-    sentences = []
-    for text in texts:
+    def __init__(self, max_features=5000):
+        self.max_features = max_features
+        self.word2vec_model = None
+        self.stopwords = set(stopwords.words('english'))
+        
+    def tokenize_and_clean(self, text):
+        """Tokenize and clean text."""
         tokens = word_tokenize(text.lower())
-        sentences.append(tokens)
+        tokens = [t for t in tokens if t.isalnum() and t not in self.stopwords]
+        return tokens
     
-    # Train Word2Vec
-    w2v_model = Word2Vec(
-        sentences=sentences,
-        vector_size=100,
-        window=CONFIG['word2vec_window'],
-        min_count=CONFIG['word2vec_min_count'],
-        workers=CONFIG['word2vec_workers'],
-        sg=1  # Skip-gram model
-    )
-    
-    print(f"  Trained on {len(sentences)} sentences")
-    print(f"  Vocabulary size: {len(w2v_model.wv)}")
-    
-    joblib.dump(w2v_model, output_path)
-    return w2v_model
-
-
-def extract_distractor_features(passage, question, correct_answer, distractors, feature_engineer):
-    """Extract features for distractor ranking."""
-    features_list = []
-    
-    for distractor in distractors:
-        lexical = feature_engineer.extract_lexical_features(
-            question, [distractor], passage
+    def train_word2vec(self, texts, vector_size=100, window=5, min_count=2):
+        """Train Word2Vec model on corpus."""
+        sentences = [self.tokenize_and_clean(text) for text in texts]
+        self.word2vec_model = Word2Vec(
+            sentences=sentences,
+            vector_size=vector_size,
+            window=window,
+            min_count=min_count,
+            workers=4,
+            sg=1  # Skip-gram
         )
-        features_list.append(lexical[0])
+        return self
     
-    # Also add features for correct answer
-    lexical_correct = feature_engineer.extract_lexical_features(
-        question, [correct_answer], passage
-    )
-    features_list.append(lexical_correct[0])
+    def get_word_vector(self, word):
+        """Get Word2Vec vector for a word."""
+        if self.word2vec_model is None:
+            return np.zeros(100)
+        try:
+            return self.word2vec_model.wv[word.lower()]
+        except KeyError:
+            return np.zeros(100)
     
-    return np.array(features_list), len(distractors)
-
-
-def train_distractor_ranker(X, y):
-    """Train distractor ranking model (binary: correct=1, distractor=0)."""
-    print("\n[Model B] Training Distractor Ranker (Logistic Regression)...")
-    
-    model = LogisticRegression(max_iter=1000, random_state=CONFIG['random_state'])
-    model.fit(X, y)
-    
-    y_pred = model.predict(X)
-    acc = accuracy_score(y, y_pred)
-    
-    print(f"  Training Accuracy: {acc:.4f}")
-    
-    return model
-
-
-def train_distractor_ranker_rf(X, y):
-    """Train distractor ranking model using Random Forest."""
-    print("\n[Model B] Training Distractor Ranker (Random Forest)...")
-    
-    model = RandomForestClassifier(n_estimators=100, random_state=CONFIG['random_state'])
-    model.fit(X, y)
-    
-    y_pred = model.predict(X)
-    acc = accuracy_score(y, y_pred)
-    
-    print(f"  Training Accuracy: {acc:.4f}")
-    
-    return model
-
-
-def extract_hint_features(passage, question, correct_answer):
-    """Extract features for hint scoring/extraction."""
-    sentences = sent_tokenize(passage)
-    
-    hint_features = []
-    hint_sentences = []
-    
-    for sent_idx, sent in enumerate(sentences):
-        # Feature 1: Keyword overlap with question
-        q_words = set(question.lower().split())
-        s_words = set(sent.lower().split())
-        overlap = len(q_words & s_words) / max(len(q_words), 1)
+    def compute_semantic_similarity(self, text1, text2):
+        """Compute semantic similarity using Word2Vec."""
+        if self.word2vec_model is None:
+            return 0.0
         
-        # Feature 2: Position in passage (normalized)
-        position = sent_idx / max(len(sentences), 1)
+        tokens1 = self.tokenize_and_clean(text1)
+        tokens2 = self.tokenize_and_clean(text2)
         
-        # Feature 3: Sentence length
-        length = len(sent.split()) / 20.0  # Normalize by typical max
+        if len(tokens1) == 0 or len(tokens2) == 0:
+            return 0.0
         
-        # Feature 4: Contains answer (should be low for good hints)
-        contains_answer = 1.0 if correct_answer.lower() in sent.lower() else 0.0
+        # Average word vectors
+        vec1 = np.mean([self.get_word_vector(t) for t in tokens1], axis=0)
+        vec2 = np.mean([self.get_word_vector(t) for t in tokens2], axis=0)
         
-        features = [overlap, position, length, contains_answer]
-        hint_features.append(features)
-        hint_sentences.append(sent)
+        # Cosine similarity
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return np.dot(vec1, vec2) / (norm1 * norm2)
     
-    return np.array(hint_features), hint_sentences
+    def compute_lexical_similarity(self, text1, text2):
+        """Compute lexical overlap."""
+        words1 = set(self.tokenize_and_clean(text1))
+        words2 = set(self.tokenize_and_clean(text2))
+        
+        if len(words1) == 0 or len(words2) == 0:
+            return 0.0
+        
+        overlap = len(words1 & words2)
+        return overlap / max(len(words1), len(words2))
+    
+    def rank_distractors(self, correct_answer, distractor_candidates, question, article, alpha=0.5):
+        """Rank distractors by similarity to correct answer and dissimilarity to question."""
+        scores = []
+        
+        for distractor in distractor_candidates:
+            # Similarity to correct answer (should be high)
+            sim_to_answer = self.compute_semantic_similarity(distractor, correct_answer)
+            lex_sim_to_answer = self.compute_lexical_similarity(distractor, correct_answer)
+            answer_score = (sim_to_answer + lex_sim_to_answer) / 2
+            
+            # Dissimilarity to question (should be low)
+            sim_to_question = self.compute_semantic_similarity(distractor, question)
+            question_penalty = 1 - sim_to_question  # Penalize if too similar to question
+            
+            # Dissimilarity to article (should be somewhat different)
+            sim_to_article = self.compute_semantic_similarity(distractor, article[:200])
+            article_penalty = 1 - sim_to_article
+            
+            # Combined score
+            score = alpha * answer_score + (1 - alpha) * (question_penalty + article_penalty) / 2
+            scores.append((distractor, score))
+        
+        # Sort by score (highest first)
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+    
+    def extract_hint_candidates(self, article, correct_answer, max_hints=5):
+        """Extract sentence fragments as hints."""
+        sentences = sent_tokenize(article)
+        hint_candidates = []
+        
+        for sentence in sentences:
+            # Check if sentence contains keywords from correct answer
+            answer_words = set(self.tokenize_and_clean(correct_answer))
+            sentence_words = set(self.tokenize_and_clean(sentence))
+            
+            overlap = len(answer_words & sentence_words)
+            if overlap > 0:
+                # Extract key phrases (up to 100 chars)
+                hint = sentence[:100].strip()
+                if len(hint) > 10:
+                    hint_candidates.append((hint, overlap))
+        
+        # Sort by overlap and return top
+        hint_candidates.sort(key=lambda x: x[1], reverse=True)
+        return [h[0] for h in hint_candidates[:max_hints]]
+    
+    def score_hint(self, hint, correct_answer, question):
+        """Score how good a hint is."""
+        # Hint should be related to answer but not directly be the answer
+        sim_to_answer = self.compute_semantic_similarity(hint, correct_answer)
+        sim_to_question = self.compute_semantic_similarity(hint, question)
+        
+        # Good hints are similar to answer but different from question
+        score = sim_to_answer * (1 - sim_to_question)
+        return score
+    
+    def save(self, path):
+        """Save generator and Word2Vec model."""
+        if self.word2vec_model:
+            self.word2vec_model.save(f"{path}_w2v_model")
+        joblib.dump(self, path)
+        print(f"✓ Saved distractor/hint generator to {path}")
 
 
-def train_hint_extractor_lr(X, y):
-    """Train hint extraction model using Logistic Regression."""
-    print("\n[Model B] Training Hint Extractor (Logistic Regression)...")
+def prepare_distractor_dataset(df):
+    """Prepare distractor dataset from wrong options."""
+    records = []
+    errors = {'skip_count': 0}
     
-    model = LogisticRegression(max_iter=1000, random_state=CONFIG['random_state'])
-    model.fit(X, y)
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Preparing distractors"):
+        try:
+            article = str(row.get('article', ''))
+            question = str(row.get('question', ''))
+            answer = str(row.get('answer', '')).strip()
+            
+            # Get options
+            options_raw = row.get('options')
+            if pd.isna(options_raw):
+                errors['skip_count'] += 1
+                continue
+            
+            if isinstance(options_raw, str) and '|' in options_raw:
+                options = options_raw.split('|')
+            else:
+                errors['skip_count'] += 1
+                continue
+            
+            options = [str(opt).strip() for opt in options if opt]
+            
+            # Map answer to index
+            if answer in ['A', 'B', 'C', 'D']:
+                answer_idx = ord(answer) - ord('A')
+            elif answer in ['0', '1', '2', '3']:
+                answer_idx = int(answer)
+            else:
+                errors['skip_count'] += 1
+                continue
+            
+            if answer_idx >= len(options):
+                errors['skip_count'] += 1
+                continue
+            
+            correct_option = options[answer_idx]
+            
+            # Collect wrong options as distractors
+            wrong_options = [opt for i, opt in enumerate(options) if i != answer_idx]
+            
+            records.append({
+                'article': article,
+                'question': question,
+                'correct_answer': correct_option,
+                'distractor_candidates': wrong_options,
+                'question_id': idx
+            })
+        except Exception as e:
+            errors['skip_count'] += 1
+            continue
     
-    y_pred = model.predict(X)
-    acc = accuracy_score(y, y_pred)
+    print(f"\n[DEBUG] Distractor dataset:")
+    print(f"  Created: {len(records)} records")
+    print(f"  Skipped: {errors['skip_count']} records")
     
-    print(f"  Training Accuracy: {acc:.4f}")
-    
-    return model
+    return pd.DataFrame(records)
 
 
-def train_hint_scorer_regression(X, y):
-    """Train hint scoring regression model."""
-    print("\n[Model B] Training Hint Scorer (Random Forest Regression)...")
-    
-    model = RandomForestRegressor(n_estimators=100, random_state=CONFIG['random_state'])
-    model.fit(X, y)
-    
-    y_pred = model.predict(X)
-    r2 = r2_score(y, y_pred)
-    rmse = np.sqrt(mean_squared_error(y, y_pred))
-    
-    print(f"  Training R²: {r2:.4f} | RMSE: {rmse:.4f}")
-    
-    return model
+print("✓ Distractor/Hint generation functions loaded")
+
 
 
 # ============================================================================
@@ -192,150 +248,216 @@ def train_hint_scorer_regression(X, y):
 # ============================================================================
 
 def main():
-    print("=" * 80)
-    print("Model B Training Pipeline: Distractor & Hint Generator")
-    print("=" * 80)
-    
-    # Create output directory
-    output_dir = Path(CONFIG['models_output_dir'])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
     # Load dataset
-    print(f"\n[Step 1] Loading dataset from {CONFIG['data_path']}...")
-    try:
-        df = pd.read_csv(CONFIG['data_path'])
-        print(f"  Loaded {len(df)} records")
-    except FileNotFoundError:
-        print(f"  ❌ Dataset not found at {CONFIG['data_path']}")
-        print("  Please download RACE dataset and place it in data/raw/")
+    print("\n[Step 1] Loading dataset...")
+    data_path = 'data/raw/train.csv'
+    
+    if not os.path.exists(data_path):
+        print(f"❌ ERROR: Dataset not found at {data_path}")
+        print("Please download RACE dataset and place train.csv in data/raw/")
         return
+    
+    df = pd.read_csv(data_path)
+    print(f"✓ Loaded {len(df)} records")
+    print(f"\nDataset shape: {df.shape}")
+    print(f"Columns: {df.columns.tolist()}")
+    
+    # Check for missing values
+    print(f"\nMissing values:\n{df.isnull().sum()}")
+    
+    # Check if options are in separate columns (A, B, C, D format)
+    if all(col in df.columns for col in ['A', 'B', 'C', 'D']):
+        print("✓ Detected options in separate columns (A, B, C, D)")
+        df['options'] = df[['A', 'B', 'C', 'D']].apply(lambda x: '|'.join(x.astype(str)), axis=1)
+        print("✓ Created 'options' column from A, B, C, D")
+    elif 'options' in df.columns:
+        print("✓ Options already in single column")
+    else:
+        print("⚠ Could not find options columns")
+    
+    # Use subset for training
+    df_subset = df.head(3000)
+    print(f"\nUsing {len(df_subset)} records for Model B training")
     
     # Prepare distractor dataset
     print("\n[Step 2] Preparing distractor dataset...")
-    distractor_df = prepare_distractor_dataset(df)
-    print(f"  Prepared {len(distractor_df)} MCQs with distractors")
+    distractor_df = prepare_distractor_dataset(df_subset)
     
-    # Feature engineering
-    print("\n[Step 3] Feature engineering...")
-    feature_engineer = FeatureEngineer(max_features=CONFIG['max_features'])
-    X_distractor, y_distractor = build_feature_matrix_model_b(distractor_df, feature_engineer, fit=False)
-    print(f"  Distractor feature matrix shape: {X_distractor.shape}")
+    if len(distractor_df) == 0:
+        print("❌ ERROR: No distractor data created.")
+        return
     
-    # Save feature engineer
-    feature_engineer.save(str(output_dir / 'feature_engineer.pkl'))
+    print(f"✓ Prepared {len(distractor_df)} distractor records")
     
-    # ========================================================================
-    # Word2Vec Embeddings
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("Training Word2Vec Embeddings")
-    print("=" * 80)
+    # ============================================================================
+    # Train Word2Vec
+    # ============================================================================
+    print("\n[Step 3] Training Word2Vec on corpus...")
+    start_time = time.time()
     
-    all_texts = (df['passage'].astype(str) + ' ' + df['question'].astype(str)).tolist()
-    w2v_model = train_word2vec_embeddings(all_texts, str(output_dir / 'word2vec_model.pkl'))
-    
-    # ========================================================================
-    # Distractor Ranking Models
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("Training Distractor Ranking Models")
-    print("=" * 80)
-    
-    # Train/test split
-    X_train_d, X_test_d, y_train_d, y_test_d = train_test_split(
-        X_distractor, y_distractor, test_size=CONFIG['test_size'],
-        random_state=CONFIG['random_state']
+    # Combine all text for Word2Vec training
+    all_texts = (
+        distractor_df['article'].tolist() +
+        distractor_df['question'].tolist() +
+        distractor_df['correct_answer'].tolist()
     )
     
-    # Logistic Regression for distractor ranking
-    lr_distractor = train_distractor_ranker(X_train_d, y_train_d)
-    y_pred_lr_d = lr_distractor.predict(X_test_d)
-    acc_lr_d = accuracy_score(y_test_d, y_pred_lr_d)
-    print(f"  LR Distractor Ranker - Test Accuracy: {acc_lr_d:.4f}")
-    joblib.dump(lr_distractor, output_dir / 'distractor_ranker_lr.pkl')
+    generator = DistractorHintGenerator()
+    generator.train_word2vec(all_texts, vector_size=100, window=5, min_count=2)
     
-    # Random Forest for distractor ranking
-    rf_distractor = train_distractor_ranker_rf(X_train_d, y_train_d)
-    y_pred_rf_d = rf_distractor.predict(X_test_d)
-    acc_rf_d = accuracy_score(y_test_d, y_pred_rf_d)
-    print(f"  RF Distractor Ranker - Test Accuracy: {acc_rf_d:.4f}")
-    joblib.dump(rf_distractor, output_dir / 'distractor_ranker_rf.pkl')
+    elapsed = time.time() - start_time
+    print(f"✓ Word2Vec training completed in {elapsed:.2f}s")
+    print(f"  Vocabulary size: {len(generator.word2vec_model.wv)}")
     
-    # Use best distractor ranker
-    best_distractor_ranker = rf_distractor if acc_rf_d > acc_lr_d else lr_distractor
-    joblib.dump(best_distractor_ranker, output_dir / 'distractor_ranker.pkl')
+    # ============================================================================
+    # Generate & Rank Distractors
+    # ============================================================================
+    print("\n[Step 4] Generating and ranking distractors...")
+    start_time = time.time()
     
-    # ========================================================================
-    # Hint Extraction & Scoring Models
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("Training Hint Extraction & Scoring Models")
-    print("=" * 80)
+    distractor_results = []
     
-    hint_features_list = []
-    hint_labels_list = []
-    hint_scores_list = []
-    
-    print("\n[Step 4] Extracting hint features...")
-    for idx, row in tqdm(distractor_df.iterrows(), total=len(distractor_df)):
-        passage = row['passage']
-        question = row['question']
-        correct_answer = row['correct_answer']
-        
-        hint_feats, hint_sents = extract_hint_features(passage, question, correct_answer)
-        
-        for feat_idx, feat in enumerate(hint_feats):
-            hint_features_list.append(feat)
+    with tqdm(total=len(distractor_df), desc="Ranking distractors") as pbar:
+        for _, row in distractor_df.iterrows():
+            try:
+                candidates = row['distractor_candidates']
+                
+                # Rank distractors
+                ranked = generator.rank_distractors(
+                    correct_answer=row['correct_answer'],
+                    distractor_candidates=candidates,
+                    question=row['question'],
+                    article=row['article'],
+                    alpha=0.6
+                )
+                
+                # Get top 2 distractors
+                top_distractors = [d[0] for d in ranked[:2]]
+                scores = [d[1] for d in ranked[:2]]
+                
+                distractor_results.append({
+                    'question_id': row['question_id'],
+                    'correct_answer': row['correct_answer'],
+                    'distractor_1': top_distractors[0] if len(top_distractors) > 0 else '',
+                    'distractor_1_score': scores[0] if len(scores) > 0 else 0.0,
+                    'distractor_2': top_distractors[1] if len(top_distractors) > 1 else '',
+                    'distractor_2_score': scores[1] if len(scores) > 1 else 0.0,
+                })
+            except Exception as e:
+                pass
             
-            # Label: relevant (1) if high keyword overlap and doesn't contain answer
-            keyword_overlap = feat[0]
-            contains_answer = feat[3]
-            label = 1 if keyword_overlap > 0.1 and contains_answer < 0.5 else 0
-            hint_labels_list.append(label)
+            pbar.update(1)
+    
+    elapsed = time.time() - start_time
+    print(f"✓ Distractor generation completed in {elapsed:.2f}s")
+    
+    distractor_results_df = pd.DataFrame(distractor_results)
+    print(f"  Generated: {len(distractor_results_df)} distractor pairs")
+    
+    # ============================================================================
+    # Extract & Score Hints
+    # ============================================================================
+    print("\n[Step 5] Extracting and scoring hints...")
+    start_time = time.time()
+    
+    hint_results = []
+    
+    with tqdm(total=len(distractor_df), desc="Extracting hints") as pbar:
+        for _, row in distractor_df.iterrows():
+            try:
+                # Extract hint candidates
+                hints = generator.extract_hint_candidates(
+                    article=row['article'],
+                    correct_answer=row['correct_answer'],
+                    max_hints=3
+                )
+                
+                # Score hints
+                hint_scores = []
+                for hint in hints:
+                    score = generator.score_hint(
+                        hint=hint,
+                        correct_answer=row['correct_answer'],
+                        question=row['question']
+                    )
+                    hint_scores.append((hint, score))
+                
+                # Sort by score
+                hint_scores.sort(key=lambda x: x[1], reverse=True)
+                
+                # Get top hint
+                top_hint = hint_scores[0][0] if len(hint_scores) > 0 else ''
+                top_hint_score = hint_scores[0][1] if len(hint_scores) > 0 else 0.0
+                
+                hint_results.append({
+                    'question_id': row['question_id'],
+                    'correct_answer': row['correct_answer'],
+                    'hint': top_hint,
+                    'hint_score': top_hint_score,
+                })
+            except Exception as e:
+                pass
             
-            # Score: cosine similarity to question (mock score)
-            hint_scores_list.append(keyword_overlap)
+            pbar.update(1)
     
-    X_hints = np.array(hint_features_list)
-    y_hints_binary = np.array(hint_labels_list)
-    y_hints_scores = np.array(hint_scores_list)
+    elapsed = time.time() - start_time
+    print(f"✓ Hint extraction completed in {elapsed:.2f}s")
     
-    print(f"  Extracted {len(X_hints)} hint features")
+    hints_df = pd.DataFrame(hint_results)
+    print(f"  Extracted: {len(hints_df)} hints")
     
-    # Train/test split for hints
-    X_train_h, X_test_h, y_train_h, y_test_h, s_train_h, s_test_h = train_test_split(
-        X_hints, y_hints_binary, y_hints_scores, test_size=CONFIG['test_size'],
-        random_state=CONFIG['random_state']
-    )
+    # ============================================================================
+    # Model B Evaluation Summary
+    # ============================================================================
+    print("\n" + "=" * 70)
+    print("MODEL B EVALUATION - DISTRACTOR & HINT GENERATION")
+    print("=" * 70)
     
-    # Hint Extractor (binary classification)
-    hint_extractor = train_hint_extractor_lr(X_train_h, y_train_h)
-    y_pred_h = hint_extractor.predict(X_test_h)
-    acc_h = accuracy_score(y_test_h, y_pred_h)
-    f1_h = f1_score(y_test_h, y_pred_h, average='binary')
-    print(f"  Hint Extractor - Test Accuracy: {acc_h:.4f} | F1: {f1_h:.4f}")
-    joblib.dump(hint_extractor, output_dir / 'hint_extractor.pkl')
+    print("\nDistractor Quality Stats:")
+    print(f"  Mean distractor 1 score: {distractor_results_df['distractor_1_score'].mean():.4f}")
+    print(f"  Mean distractor 2 score: {distractor_results_df['distractor_2_score'].mean():.4f}")
     
-    # Hint Scorer (regression)
-    hint_scorer = train_hint_scorer_regression(X_train_h, s_train_h)
-    s_pred_h = hint_scorer.predict(X_test_h)
-    r2_h = r2_score(s_test_h, s_pred_h)
-    print(f"  Hint Scorer - Test R²: {r2_h:.4f}")
-    joblib.dump(hint_scorer, output_dir / 'hint_scorer.pkl')
+    print("\nHint Quality Stats:")
+    print(f"  Mean hint score: {hints_df['hint_score'].mean():.4f}")
+    print(f"  Median hint score: {hints_df['hint_score'].median():.4f}")
     
-    # ========================================================================
-    # Evaluation Summary
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("Evaluation Summary")
-    print("=" * 80)
+    print("\nSample Distractors:")
+    for i in range(min(3, len(distractor_results_df))):
+        row = distractor_results_df.iloc[i]
+        print(f"\n  Example {i+1}:")
+        print(f"    Answer: {row['correct_answer']}")
+        print(f"    Distractor 1: {row['distractor_1']} (score: {row['distractor_1_score']:.3f})")
+        print(f"    Distractor 2: {row['distractor_2']} (score: {row['distractor_2_score']:.3f})")
     
-    print(f"Distractor Ranker (RF)      | Accuracy: {acc_rf_d:.4f}")
-    print(f"Hint Extractor (LR)         | Accuracy: {acc_h:.4f} | F1: {f1_h:.4f}")
-    print(f"Hint Scorer (RF Regression) | R²: {r2_h:.4f}")
+    print("\nSample Hints:")
+    for i in range(min(3, len(hints_df))):
+        row = hints_df.iloc[i]
+        print(f"\n  Example {i+1}:")
+        print(f"    Answer: {row['correct_answer']}")
+        print(f"    Hint: {row['hint']} (score: {row['hint_score']:.3f})")
     
-    print(f"\n✓ All models saved to {output_dir}")
-    print("=" * 80)
+    # ============================================================================
+    # Save Model B Artifacts
+    # ============================================================================
+    print("\n[Final] Saving Model B artifacts...")
+    
+    os.makedirs('models/model_b/traditional/', exist_ok=True)
+    
+    # Save models
+    generator.save('models/model_b/traditional/distractor_hint_generator')
+    joblib.dump(generator.word2vec_model, 'models/model_b/traditional/word2vec_model.pkl')
+    
+    # Save results
+    distractor_results_df.to_csv('models/model_b/traditional/distractor_results.csv', index=False)
+    hints_df.to_csv('models/model_b/traditional/hints_results.csv', index=False)
+    
+    print("✓ All Model B artifacts saved to models/model_b/traditional/")
+    print("\nSaved files:")
+    print("  - distractor_hint_generator.pkl")
+    print("  - word2vec_model.pkl (also _w2v_model file)")
+    print("  - distractor_results.csv")
+    print("  - hints_results.csv")
+    print("\n✓ TRAINING COMPLETE!")
 
 
 if __name__ == "__main__":
