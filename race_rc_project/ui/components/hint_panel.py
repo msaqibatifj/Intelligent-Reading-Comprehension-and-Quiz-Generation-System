@@ -2,6 +2,7 @@
 
 import streamlit as st
 from .header import render_screen_title
+from .utils import set_screen
 
 def render_hint_panel():
     """Render Screen 3: Hint Panel."""
@@ -48,15 +49,15 @@ def render_hint_panel_buttons():
     
     with col1:
         if st.button("Back to Quiz", use_container_width=True, key="btn_hint_back_quiz"):
-            st.session_state.screen = 'quiz_view'
+            set_screen('quiz_view')
             st.rerun()
     
     with col2:
         if st.button("View Analytics", use_container_width=True, key="btn_hint_analytics"):
-            st.session_state.screen = 'analytics'
+            set_screen('analytics')
             st.rerun()
     
     with col3:
         if st.button("Back to Input", use_container_width=True, key="btn_hint_back_input"):
-            st.session_state.screen = 'article_input'
+            set_screen('article_input')
             st.rerun()

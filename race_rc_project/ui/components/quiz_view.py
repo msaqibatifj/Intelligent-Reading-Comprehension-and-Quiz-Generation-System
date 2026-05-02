@@ -2,7 +2,33 @@
 
 import streamlit as st
 from .header import render_screen_title
-from .utils import get_option_letter
+from .utils import get_option_letter, set_screen
+
+
+def _fallback_hints(article: str, correct_answer: str, num_hints: int = 3):
+    """Generate simple fallback hints from the article text."""
+    sentences = [s.strip() for s in article.split('.') if s.strip()]
+    hints = []
+
+    for sentence in sentences:
+        if correct_answer and correct_answer.lower() in sentence.lower():
+            continue
+        hints.append({
+            'text': sentence,
+            'score': max(0.5, 0.85 - (0.05 * len(hints))),
+            'source': 'fallback'
+        })
+        if len(hints) >= num_hints:
+            break
+
+    if not hints:
+        hints = [{
+            'text': 'Review the passage for key details related to the question.',
+            'score': 0.5,
+            'source': 'fallback'
+        }]
+
+    return hints
 
 def render_quiz_view():
     """Render Screen 2: Quiz View."""
@@ -54,24 +80,33 @@ def render_quiz_view_buttons():
     
     with col1:
         if st.button("Back to Input", use_container_width=True, key="btn_back_to_input"):
-            st.session_state.screen = 'article_input'
+            set_screen('article_input')
             st.rerun()
     
     with col2:
         if st.button("Show Hints", use_container_width=True, key="btn_show_hints"):
-            from ..src.inference import UnifiedInference
             inference = st.session_state.get('inference')
-            
+            correct_answer_text = st.session_state.options[st.session_state.correct_answer]
+
+            hints = []
             if inference:
-                correct_answer_text = st.session_state.options[st.session_state.correct_answer]
                 hints_result = inference.generate_hints(
                     correct_answer=correct_answer_text,
                     article=st.session_state.article,
                     num_hints=3
                 )
-                st.session_state.hints = hints_result.get('hints', [])
-            
-            st.session_state.screen = 'hint_panel'
+                if isinstance(hints_result, dict):
+                    hints = hints_result.get('hints', [])
+
+            if not hints:
+                hints = _fallback_hints(
+                    st.session_state.article,
+                    correct_answer_text,
+                    num_hints=3
+                )
+
+            st.session_state.hints = hints
+            set_screen('hint_panel')
             st.rerun()
     
     with col3:
@@ -79,7 +114,7 @@ def render_quiz_view_buttons():
             if st.session_state.user_answer is None:
                 st.error("Please select an answer first!")
             else:
-                st.session_state.screen = 'analytics'
+                set_screen('analytics')
                 st.rerun()
     
     with col4:

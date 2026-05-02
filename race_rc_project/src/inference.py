@@ -24,6 +24,7 @@ class ModelAInference:
         """
         self.models = {}
         self.feature_engineer = None
+        self.load_errors = []
         self.load_models(model_paths)
     
     def load_models(self, model_paths):
@@ -31,9 +32,23 @@ class ModelAInference:
         for model_name, path in model_paths.items():
             try:
                 self.models[model_name] = joblib.load(path)
-                print(f"✓ Loaded {model_name} from {path}")
-            except FileNotFoundError:
-                print(f"⚠ Model {model_name} not found at {path}")
+                print(f"[OK] Loaded {model_name} from {path}")
+            except FileNotFoundError as exc:
+                self.load_errors.append({
+                    'model': model_name,
+                    'path': str(path),
+                    'error': 'FileNotFoundError',
+                    'detail': str(exc)
+                })
+                print(f"[WARN] Model {model_name} not found at {path}")
+            except Exception as exc:
+                self.load_errors.append({
+                    'model': model_name,
+                    'path': str(path),
+                    'error': type(exc).__name__,
+                    'detail': str(exc)
+                })
+                print(f"[WARN] Failed to load {model_name} from {path}: {exc}")
     
     def verify_answer(self, passage, question, option, method='ensemble'):
         """
@@ -80,6 +95,7 @@ class ModelBInference:
         """
         self.models = {}
         self.feature_engineer = None
+        self.load_errors = []
         self.load_models(model_paths)
     
     def load_models(self, model_paths):
@@ -87,9 +103,23 @@ class ModelBInference:
         for model_name, path in model_paths.items():
             try:
                 self.models[model_name] = joblib.load(path)
-                print(f"✓ Loaded {model_name} from {path}")
-            except FileNotFoundError:
-                print(f"⚠ Model {model_name} not found at {path}")
+                print(f"[OK] Loaded {model_name} from {path}")
+            except FileNotFoundError as exc:
+                self.load_errors.append({
+                    'model': model_name,
+                    'path': str(path),
+                    'error': 'FileNotFoundError',
+                    'detail': str(exc)
+                })
+                print(f"[WARN] Model {model_name} not found at {path}")
+            except Exception as exc:
+                self.load_errors.append({
+                    'model': model_name,
+                    'path': str(path),
+                    'error': type(exc).__name__,
+                    'detail': str(exc)
+                })
+                print(f"[WARN] Failed to load {model_name} from {path}: {exc}")
     
     def generate_distractors(self, passage, question, correct_answer, num_distractors=3):
         """
@@ -166,6 +196,10 @@ class UnifiedInference:
         self.model_b_paths = model_b_paths
         self.model_a = ModelAInference(model_a_paths)
         self.model_b = ModelBInference(model_b_paths)
+        self.load_errors = {
+            'model_a': self.model_a.load_errors,
+            'model_b': self.model_b.load_errors
+        }
     
     def verify_qa(self, question, answer, article):
         """Verify if a Q&A pair is valid using Model A ensemble."""

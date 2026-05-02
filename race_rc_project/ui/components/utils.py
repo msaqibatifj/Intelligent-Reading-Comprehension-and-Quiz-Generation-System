@@ -1,5 +1,7 @@
 """Utility functions for the app"""
 
+import streamlit as st
+
 def validate_quiz_input(article, question, options, correct_answer):
     """Validate that all quiz input fields are filled."""
     errors = []
@@ -37,3 +39,8 @@ def check_user_answer(user_answer_idx, correct_answer_idx):
     if user_answer_idx is None:
         return None
     return user_answer_idx == correct_answer_idx
+
+
+def set_screen(screen_name: str) -> None:
+    """Update the active screen."""
+    st.session_state.screen = screen_name

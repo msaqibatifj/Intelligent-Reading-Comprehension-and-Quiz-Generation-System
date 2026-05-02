@@ -2,7 +2,7 @@
 
 import streamlit as st
 from .header import render_screen_title
-from .utils import validate_quiz_input
+from .utils import validate_quiz_input, set_screen
 from .sample_data import (
     load_ai_generated_mode,
     load_model_generated_questions_mode,
@@ -113,7 +113,7 @@ def render_article_input_buttons():
             if not is_valid:
                 st.error("\n".join(errors))
             else:
-                st.session_state.screen = 'quiz_view'
+                set_screen('quiz_view')
                 st.rerun()
     
     with col2:
@@ -240,7 +240,7 @@ def render_ai_generated_mode():
         if not all([st.session_state.article, st.session_state.question, st.session_state.options[0]]):
             st.error("Please fill in article, question, and answer!")
         else:
-            st.session_state.screen = 'quiz_view'
+            set_screen('quiz_view')
             st.rerun()
 
 
@@ -373,7 +373,7 @@ def render_model_generated_mode():
     
     # Proceed button
     if st.button("Next to Quiz", type="primary", use_container_width=True, key="model_gen_next"):
-        st.session_state.screen = 'quiz_view'
+        set_screen('quiz_view')
         st.rerun()
 
 
@@ -454,5 +454,5 @@ def render_user_provided_mode():
         if not all([st.session_state.article, st.session_state.question, st.session_state.options[0]]):
             st.error("Please fill in all fields!")
         else:
-            st.session_state.screen = 'quiz_view'
+            set_screen('quiz_view')
             st.rerun()

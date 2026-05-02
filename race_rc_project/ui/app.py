@@ -54,27 +54,33 @@ apply_styles()
 def load_models():
     """Load unified inference models."""
     try:
+        base_dir = Path(__file__).parent.parent
         # Define model paths
         model_a_paths = {
-            'lr': 'models/model_a/traditional/lr_model.pkl',
-            'svm': 'models/model_a/traditional/svm_model.pkl',
-            'nb': 'models/model_a/traditional/nb_model.pkl',
-            'rf': 'models/model_a/traditional/rf_model.pkl',
-            'xgb': 'models/model_a/traditional/xgb_model.pkl',
-            'ensemble_voting': 'models/model_a/traditional/ensemble_voting_model.pkl',
-            'ensemble_stacking': 'models/model_a/traditional/ensemble_stacking_model.pkl',
-            'kmeans': 'models/model_a/traditional/kmeans_model.pkl',
-            'label_propagation': 'models/model_a/traditional/label_propagation_model.pkl',
-            'gmm': 'models/model_a/traditional/gmm_model.pkl',
-            'feature_engineer': 'models/model_a/traditional/feature_engineer.pkl',
+            'lr': base_dir / 'models/model_a/traditional/lr_model.pkl',
+            'svm': base_dir / 'models/model_a/traditional/svm_model.pkl',
+            'nb': base_dir / 'models/model_a/traditional/nb_model.pkl',
+            'rf': base_dir / 'models/model_a/traditional/rf_model.pkl',
+            'xgb': base_dir / 'models/model_a/traditional/xgb_model.pkl',
+            'ensemble_voting': base_dir / 'models/model_a/traditional/ensemble_voting_model.pkl',
+            'ensemble_stacking': base_dir / 'models/model_a/traditional/ensemble_stacking_model.pkl',
+            'kmeans': base_dir / 'models/model_a/traditional/kmeans_model.pkl',
+            'label_propagation': base_dir / 'models/model_a/traditional/label_propagation_model.pkl',
+            'gmm': base_dir / 'models/model_a/traditional/gmm_model.pkl',
+            'feature_engineer': base_dir / 'models/model_a/traditional/feature_engineer.pkl',
         }
         
         model_b_paths = {
-            'distractor_hint_generator': 'models/model_b/traditional/distractor_hint_generator.pkl',
-            'word2vec': 'models/model_b/traditional/word2vec_model.pkl',
+            'distractor_hint_generator': base_dir / 'models/model_b/traditional/distractor_hint_generator.pkl',
+            'word2vec': base_dir / 'models/model_b/traditional/word2vec_model.pkl',
         }
         
         inference = UnifiedInference(model_a_paths, model_b_paths)
+        if getattr(inference, 'load_errors', None):
+            errors = inference.load_errors
+            if errors.get('model_a') or errors.get('model_b'):
+                st.warning("Some models failed to load. See details below.")
+                st.json(errors)
         return inference
     except Exception as e:
         st.error(f"Error loading models: {e}")
@@ -110,7 +116,7 @@ def initialize_session_state():
     if 'hints' not in st.session_state:
         st.session_state.hints = []
     
-    if 'inference' not in st.session_state:
+    if 'inference' not in st.session_state or st.session_state.inference is None:
         st.session_state.inference = load_models()
 
 initialize_session_state()

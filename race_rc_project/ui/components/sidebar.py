@@ -2,6 +2,7 @@
 
 import streamlit as st
 import json
+from .utils import set_screen
 
 def render_sidebar():
     """Render sidebar navigation and state display."""
@@ -18,6 +19,10 @@ def render_sidebar():
         
         # Get current screen
         current_screen = st.session_state.get('screen', 'article_input')
+
+        # Keep sidebar radio value aligned with current screen before widget creation.
+        if st.session_state.get('sidebar_screen_select') != current_screen:
+            st.session_state.sidebar_screen_select = current_screen
         
         # Find current index
         screen_list = list(screen_options.keys())
@@ -31,13 +36,12 @@ def render_sidebar():
             "Go to:",
             options=screen_list,
             format_func=lambda x: screen_options[x],
-            index=current_idx,
             key="sidebar_screen_select"
         )
         
         # Update screen if changed
         if selected_screen != current_screen:
-            st.session_state.screen = selected_screen
+            set_screen(selected_screen)
             st.rerun()
         
         st.divider()

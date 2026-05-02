@@ -2,7 +2,7 @@
 
 import streamlit as st
 from .header import render_screen_title
-from .utils import get_option_letter
+from .utils import get_option_letter, set_screen
 
 def render_analytics_dashboard():
     """Render Screen 4: Analytics Dashboard."""
@@ -12,6 +12,13 @@ def render_analytics_dashboard():
     
     if not inference:
         st.error("Inference model not loaded")
+        if st.button("Retry Loading Inference", key="btn_retry_inference"):
+            try:
+                from ui.app import load_models
+                st.session_state.inference = load_models()
+            except Exception as exc:
+                st.error(f"Retry failed: {exc}")
+            st.rerun()
         return
     
     # User answer vs correct answer
@@ -47,9 +54,9 @@ def render_answer_comparison():
     if st.session_state.user_answer is not None:
         is_correct = st.session_state.user_answer == st.session_state.correct_answer
         if is_correct:
-            st.success("[CORRECT] Your answer matches the expected answer!", icon="check")
+            st.success("[CORRECT] Your answer matches the expected answer!")
         else:
-            st.error("[INCORRECT] Your answer does not match the expected answer.", icon="x")
+            st.error("[INCORRECT] Your answer does not match the expected answer.")
 
 def render_model_a_predictions(inference):
     """Render Model A Q&A Verification predictions."""
@@ -145,22 +152,22 @@ def render_analytics_buttons():
     
     with col1:
         if st.button("Back to Quiz", use_container_width=True, key="btn_analytics_back_quiz"):
-            st.session_state.screen = 'quiz_view'
+            set_screen('quiz_view')
             st.rerun()
     
     with col2:
         if st.button("View Hints", use_container_width=True, key="btn_analytics_hints"):
-            st.session_state.screen = 'hint_panel'
+            set_screen('hint_panel')
             st.rerun()
     
     with col3:
         if st.button("New Quiz", use_container_width=True, key="btn_analytics_new"):
-            st.session_state.screen = 'article_input'
+            set_screen('article_input')
             st.session_state.user_answer = None
             st.session_state.hints = []
             st.rerun()
     
     with col4:
         if st.button("Back to Input", use_container_width=True, key="btn_analytics_back_input"):
-            st.session_state.screen = 'article_input'
+            set_screen('article_input')
             st.rerun()
