@@ -44,3 +44,29 @@ def check_user_answer(user_answer_idx, correct_answer_idx):
 def set_screen(screen_name: str) -> None:
     """Update the active screen."""
     st.session_state.screen = screen_name
+
+
+def get_active_question_data():
+    """Return the currently active generated question data, or a single-question fallback."""
+    question_bundles = st.session_state.get('question_bundles', [])
+    generated_questions = st.session_state.get('generated_questions', [])
+    current_index = st.session_state.get('current_question_index', 0)
+
+    if question_bundles:
+        current_index = max(0, min(current_index, len(question_bundles) - 1))
+        return question_bundles[current_index], current_index, len(question_bundles)
+
+    if generated_questions:
+        current_index = max(0, min(current_index, len(generated_questions) - 1))
+        return generated_questions[current_index], current_index, len(generated_questions)
+
+    return {
+        'question': st.session_state.get('question', ''),
+        'source_sentence': st.session_state.get('article', ''),
+        'template_type': 'single',
+    }, 0, 1
+
+
+def set_question_index(index: int) -> None:
+    """Update the active question index within the generated set."""
+    st.session_state.current_question_index = index

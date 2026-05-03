@@ -2,11 +2,16 @@
 
 import streamlit as st
 from .header import render_screen_title
-from .utils import get_option_letter, set_screen
+from .utils import get_option_letter, set_screen, get_active_question_data
 
 def render_analytics_dashboard():
     """Render Screen 4: Analytics Dashboard."""
     render_screen_title(4, "Analytics Dashboard")
+
+    active_question, current_index, total_questions = get_active_question_data()
+    if total_questions > 1:
+        st.markdown(f"**Question {current_index + 1} of {total_questions}**")
+        st.markdown(f"**Active Question:** {active_question['question']}")
     
     inference = st.session_state.get('inference')
     
@@ -35,6 +40,7 @@ def render_analytics_dashboard():
 
 def render_answer_comparison():
     """Render user answer vs correct answer comparison."""
+    active_question, _, _ = get_active_question_data()
     col1, col2 = st.columns(2)
     
     with col1:
@@ -47,7 +53,7 @@ def render_answer_comparison():
     
     with col2:
         st.markdown("### Correct Answer")
-        correct_answer = st.session_state.options[st.session_state.correct_answer]
+        correct_answer = active_question.get('answer', st.session_state.options[st.session_state.correct_answer])
         st.markdown(f"**Option {get_option_letter(st.session_state.correct_answer)}: {correct_answer}**")
     
     # User answer verification
@@ -60,12 +66,13 @@ def render_answer_comparison():
 
 def render_model_a_predictions(inference):
     """Render Model A Q&A Verification predictions."""
+    active_question, _, _ = get_active_question_data()
     st.markdown("### Model A - Q&A Verification (Ensemble of 10 Models)")
     
     with st.spinner("Running Model A predictions..."):
         qa_result = inference.verify_qa(
-            question=st.session_state.question,
-            answer=st.session_state.options[st.session_state.correct_answer],
+            question=active_question.get('question', st.session_state.question),
+            answer=active_question.get('answer', st.session_state.options[st.session_state.correct_answer]),
             article=st.session_state.article
         )
     
@@ -124,15 +131,16 @@ def render_model_a_predictions(inference):
 
 def render_model_b_predictions(inference):
     """Render Model B Distractor Ranking predictions."""
+    active_question, _, _ = get_active_question_data()
     st.markdown("### Model B - Distractor Ranking")
     
-    wrong_options = [opt for i, opt in enumerate(st.session_state.options) 
+    wrong_options = [opt for i, opt in enumerate(active_question.get('options', st.session_state.options)) 
                      if i != st.session_state.correct_answer]
     
     distractor_result = inference.generate_quiz_options(
-        correct_answer=st.session_state.options[st.session_state.correct_answer],
+        correct_answer=active_question.get('answer', st.session_state.options[st.session_state.correct_answer]),
         wrong_options=wrong_options,
-        question=st.session_state.question,
+        question=active_question.get('question', st.session_state.question),
         article=st.session_state.article
     )
     

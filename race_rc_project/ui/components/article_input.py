@@ -2,7 +2,7 @@
 
 import streamlit as st
 from .header import render_screen_title
-from .utils import validate_quiz_input, set_screen
+from .utils import validate_quiz_input, set_screen, set_question_index
 from .sample_data import (
     load_ai_generated_mode,
     load_model_generated_questions_mode,
@@ -11,6 +11,7 @@ from .sample_data import (
     get_random_article,
 )
 
+
 def render_article_input():
     """Render Screen 1: Article Input with 3 modes."""
     render_screen_title(1, "Article Input")
@@ -18,6 +19,15 @@ def render_article_input():
     # Initialize mode if not set
     if 'quiz_mode' not in st.session_state:
         st.session_state.quiz_mode = 'user_provided'
+    
+    # Handle deferred article loading (must happen BEFORE widgets render)
+    if 'pending_load' in st.session_state and st.session_state.pending_load:
+        if st.session_state.pending_load == 'random':
+            load_random()
+        elif st.session_state.pending_load == 'example':
+            load_example()
+        st.session_state.pending_load = None
+        st.rerun()
     
     # Mode selection tabs
     st.markdown("### Choose Quiz Mode")
@@ -137,9 +147,15 @@ def load_example():
         "It is one of the most iconic structures in the world. Construction began as early as the 7th century BC "
         "and continued for over 2,000 years."
     )
+    # Update widget-specific keys too
+    st.session_state.ai_gen_article = st.session_state.article
+    st.session_state.model_gen_article = st.session_state.article
+    st.session_state.user_article = st.session_state.article
     st.session_state.question = ""
     st.session_state.options = ["", "", "", ""]
     st.session_state.correct_answer = 0
+    st.session_state.generated_questions = []
+    st.session_state.current_question_index = 0
 
 
 def load_random():
@@ -149,9 +165,16 @@ def load_random():
     """
     article = get_random_article()
     st.session_state.article = article
+    # Update widget-specific keys too
+    st.session_state.ai_gen_article = article
+    st.session_state.model_gen_article = article
+    st.session_state.user_article = article
     st.session_state.question = ""
     st.session_state.options = ["", "", "", ""]
     st.session_state.correct_answer = 0
+    st.session_state.generated_questions = []
+    st.session_state.current_question_index = 0
+    st.session_state.question_bundles = []
 
 
 # =============================================================================
@@ -184,11 +207,11 @@ def render_ai_generated_mode():
     with col2:
         st.markdown("### Quick Load")
         if st.button("Load Random", use_container_width=True, key="ai_gen_load"):
-            load_random()
+            st.session_state.pending_load = 'random'
             st.rerun()
         
         if st.button("Load Example", use_container_width=True, key="ai_gen_example"):
-            load_example()
+            st.session_state.pending_load = 'example'
             st.rerun()
     
     # Generate question from AI
@@ -278,11 +301,11 @@ def render_model_generated_mode():
     with col2:
         st.markdown("### Quick Load")
         if st.button("Random Article", use_container_width=True, key="model_gen_random"):
-            load_random()
+            st.session_state.pending_load = 'random'
             st.rerun()
         
         if st.button("Example", use_container_width=True, key="model_gen_example"):
-            load_example()
+            st.session_state.pending_load = 'example'
             st.rerun()
     
     # Generate question using Model A 3-step pipeline
@@ -301,6 +324,9 @@ def render_model_generated_mode():
             st.session_state.article = qa_data['article']
             st.session_state.options = qa_data['options']
             st.session_state.correct_answer = qa_data['correct_answer']
+            st.session_state.generated_questions = qa_data.get('generated_questions', [])
+            st.session_state.question_bundles = qa_data.get('question_bundles', [])
+            st.session_state.current_question_index = 0
             
             st.success("✅ Full Q&A Generated (Question + Answer + Distractors)!")
             st.info(f"**Pipeline:**\n{qa_data.get('pipeline_description', 'Step 1→2→3')}\n\n{qa_data['question_hint']}")
@@ -318,6 +344,36 @@ def render_model_generated_mode():
     if not st.session_state.question:
         st.warning("Click 'Generate Question (3-Step)' to generate full Q&A")
         return
+
+    if st.session_state.generated_questions:
+        with st.expander(f"View all {len(st.session_state.generated_questions)} generated questions", expanded=False):
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+            with nav_col1:
+                if st.button("Previous", key="model_gen_prev_question"):
+                    set_question_index(max(0, st.session_state.current_question_index - 1))
+                    st.rerun()
+            with nav_col2:
+                st.markdown(
+                    f"**Active question:** {st.session_state.current_question_index + 1} / {len(st.session_state.generated_questions)}"
+                )
+            with nav_col3:
+                if st.button("Next", key="model_gen_next_question"):
+                    set_question_index(min(len(st.session_state.generated_questions) - 1, st.session_state.current_question_index + 1))
+                    st.rerun()
+
+            for idx, question_data in enumerate(st.session_state.generated_questions, 1):
+                prefix = "▶ " if (idx - 1) == st.session_state.current_question_index else ""
+                st.markdown(
+                    f"{prefix}{idx}. {question_data['question']}  \n"
+                    f"   - Type: {question_data.get('template_type', 'unknown')}  \n"
+                    f"   - Source: {question_data.get('source_sentence', '')[:120]}"
+                )
+
+    if st.session_state.get('question_bundles'):
+        active_bundle = st.session_state.question_bundles[st.session_state.current_question_index]
+        st.markdown("### Active Question Bundle")
+        st.text_input("Active Question", value=active_bundle['question'], disabled=True, key="model_gen_active_question")
+        st.text_input("Generated Answer", value=active_bundle['answer'], disabled=True, key="model_gen_active_answer")
     
     # Display generated answer and distractors (read-only)
     st.markdown("### Generated Answer & Distractors")
@@ -408,11 +464,11 @@ def render_user_provided_mode():
     with col2:
         st.markdown("### Quick Load")
         if st.button("Random Article", use_container_width=True, key="user_random"):
-            load_random()
+            st.session_state.pending_load = 'random'
             st.rerun()
         
         if st.button("Example (Great Wall)", use_container_width=True, key="user_example"):
-            load_example()
+            st.session_state.pending_load = 'example'
             st.rerun()
     
     st.markdown("### Question")

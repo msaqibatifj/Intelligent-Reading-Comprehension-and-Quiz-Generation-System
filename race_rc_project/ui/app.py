@@ -115,6 +115,15 @@ def initialize_session_state():
     
     if 'hints' not in st.session_state:
         st.session_state.hints = []
+
+    if 'generated_questions' not in st.session_state:
+        st.session_state.generated_questions = []
+
+    if 'current_question_index' not in st.session_state:
+        st.session_state.current_question_index = 0
+
+    if 'answer_revealed' not in st.session_state:
+        st.session_state.answer_revealed = False
     
     if 'inference' not in st.session_state or st.session_state.inference is None:
         st.session_state.inference = load_models()

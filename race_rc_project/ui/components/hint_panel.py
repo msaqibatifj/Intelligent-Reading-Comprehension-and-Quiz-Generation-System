@@ -3,16 +3,18 @@
 import streamlit as st
 from .header import render_screen_title
 from .utils import set_screen
+from .utils import get_active_question_data
 
 def render_hint_panel():
     """Render Screen 3: Hint Panel."""
     render_screen_title(3, "Hint Panel")
+
+    active_question, current_index, total_questions = get_active_question_data()
+    if total_questions > 1:
+        st.markdown(f"**Question {current_index + 1} of {total_questions}**")
+    st.markdown(f"**Active Question:** {active_question.get('question', st.session_state.get('question', ''))}")
     
-    # Display correct answer
-    correct_answer = st.session_state.options[st.session_state.correct_answer]
-    st.markdown(f"**Correct Answer:** {correct_answer}")
-    
-    # Display hints
+    # Display hints (NOT the correct answer)
     if st.session_state.hints:
         render_hints_list()
     else:

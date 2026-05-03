@@ -96,68 +96,242 @@ def extract_important_sentences(article: str, top_k: int = 3) -> List[Tuple[str,
         return [(s, 1.0) for s in sentences[:top_k]]
 
 
+def _extract_entities(sentence: str) -> List[str]:
+    """Extract meaningful named entities from a sentence.
+
+    Filters out common sentence-starting words, articles, pronouns,
+    conjunctions, and other non-entity capitalized words.
+    Also strips possessive suffixes ('s) and merges partial matches
+    (e.g. "Gutenberg" merges into "Johannes Gutenberg").
+    """
+    STOPWORDS = {
+        'the', 'this', 'that', 'these', 'those', 'a', 'an',
+        'it', 'its', 'they', 'their', 'them', 'he', 'she',
+        'his', 'her', 'we', 'our', 'you', 'your', 'my',
+        'before', 'after', 'during', 'since', 'until', 'while',
+        'because', 'although', 'however', 'moreover', 'furthermore',
+        'also', 'but', 'and', 'or', 'nor', 'yet', 'so',
+        'what', 'which', 'who', 'whom', 'whose', 'where', 'when',
+        'how', 'why', 'if', 'then', 'than', 'both', 'either',
+        'neither', 'not', 'only', 'just', 'even', 'still',
+        'many', 'much', 'most', 'some', 'any', 'all', 'each',
+        'every', 'such', 'other', 'another', 'several',
+        'there', 'here', 'now', 'today', 'according', 'based',
+        'one', 'two', 'three', 'four', 'five', 'first', 'second',
+        'new', 'old', 'good', 'bad', 'great', 'small', 'large',
+        'key', 'major', 'important', 'significant', 'modern',
+        'instead', 'over', 'into', 'from', 'with', 'without',
+        'for', 'about', 'between', 'through', 'under', 'above',
+    }
+
+    words = sentence.split()
+    raw_entities = []
+    i = 0
+    while i < len(words):
+        word_clean = words[i].strip('.,;:!?\'"()-')
+        # Strip possessive suffix
+        if word_clean.endswith("'s") or word_clean.endswith("\u2019s"):
+            word_clean = word_clean[:-2]
+        if (len(word_clean) > 1
+                and word_clean[0].isupper()
+                and word_clean.lower() not in STOPWORDS):
+            # Greedily collect multi-word entity (consecutive capitalized words)
+            entity_parts = [word_clean]
+            j = i + 1
+            while j < len(words):
+                next_clean = words[j].strip('.,;:!?\'"()-')
+                if next_clean.endswith("'s") or next_clean.endswith("\u2019s"):
+                    next_clean = next_clean[:-2]
+                if (len(next_clean) > 1
+                        and next_clean[0].isupper()
+                        and next_clean.lower() not in STOPWORDS):
+                    entity_parts.append(next_clean)
+                    j += 1
+                else:
+                    break
+            entity = ' '.join(entity_parts)
+            raw_entities.append(entity)
+            i = j
+        else:
+            i += 1
+
+    # Merge: if a shorter entity is a substring of a longer one, keep only the longer
+    # e.g. "Gutenberg" is absorbed by "Johannes Gutenberg"
+    merged = []
+    # Sort longest first so we check against longest entities first
+    sorted_entities = sorted(raw_entities, key=len, reverse=True)
+    for entity in sorted_entities:
+        # Check if this entity is already a substring of an entity we kept
+        if any(entity in kept and entity != kept for kept in merged):
+            continue
+        # Check if we already have a duplicate
+        if entity in merged:
+            continue
+        merged.append(entity)
+
+    # Return in original discovery order
+    ordered = []
+    for entity in raw_entities:
+        # Find the merged version that contains this entity
+        for kept in merged:
+            if entity in kept and kept not in ordered:
+                ordered.append(kept)
+                break
+    return ordered
+
+
+def _extract_key_phrases(sentence: str) -> Dict:
+    """Extract structured information from a sentence for question building."""
+    lower = sentence.lower()
+    words = sentence.split()
+
+    info: Dict = {
+        'entities': _extract_entities(sentence),
+        'has_numbers': bool(re.search(r'\b\d{2,}\b', sentence)),
+        'numbers': re.findall(r'\b\d[\d,]*\b', sentence),
+        'has_cause_effect': any(w in lower for w in [
+            'because', 'caused', 'led to', 'resulted in', 'due to',
+            'therefore', 'consequently', 'as a result', 'allowed for',
+            'played a crucial role', 'contributed to', 'enabled',
+        ]),
+        'has_comparison': any(w in lower for w in [
+            'unlike', 'compared to', 'whereas', 'while', 'but',
+            'however', 'in contrast', 'on the other hand',
+            'more than', 'less than', 'rather than',
+        ]),
+        'has_temporal': any(w in lower for w in [
+            'before', 'after', 'during', 'when', 'around',
+            'century', 'year', 'era', 'period', 'age',
+        ]),
+        'has_process': any(w in lower for w in [
+            'process', 'method', 'technique', 'step', 'stage',
+            'through', 'by', 'using', 'via', 'involves',
+        ]),
+        'word_count': len(words),
+    }
+    return info
+
+
 def generate_question_candidates(sentence: str) -> List[Dict]:
     """
     STEP 2: Generate Wh-question candidates from a sentence using templates.
     
-    Applies question templates to the sentence to create multiple question variants.
-    Each candidate is a dict with 'question', 'template_type', 'confidence'.
-    
-    Example:
-        "The student studied hard" → [
-            {"question": "What did the student do?", "template_type": "what_action", ...},
-            {"question": "How did the student approach their work?", "template_type": "how", ...},
-        ]
+    Applies context-aware question templates to produce specific, complex
+    questions rather than generic ones. Uses only ONE entity per template
+    type to avoid repetitive questions across the set.
     """
     candidates = []
-    words = sentence.split()
-    
-    # Template 1: "What did/is/was X doing/done?"
-    if any(verb in sentence.lower() for verb in ['did', 'was', 'is', 'has']):
+    info = _extract_key_phrases(sentence)
+    entities = info['entities']
+    # Pick the single best (longest / most specific) entity for this sentence
+    primary_entity = entities[0] if entities else None
+
+    # --- ONE entity-specific question per sentence (using the best entity) ---
+    if primary_entity:
         candidates.append({
-            'question': f"What is the main action or event described?",
-            'template_type': 'main_action',
-            'confidence': 0.8,
-            'source_sentence': sentence
+            'question': f"According to the passage, what role does {primary_entity} play in the events described?",
+            'template_type': 'entity_role',
+            'confidence': 0.85,
+            'source_sentence': sentence,
         })
-    
-    # Template 2: "What is X?" - extract subjects
-    nouns = [w.strip('.,;:') for w in words if len(w) > 3 and w[0].isupper()]
-    if nouns:
-        subject = nouns[0]
+
+    # --- Cause-effect (one per sentence) ---
+    if info['has_cause_effect']:
+        if primary_entity:
+            candidates.append({
+                'question': f"What was the direct consequence of {primary_entity} as described in the passage?",
+                'template_type': 'cause_effect',
+                'confidence': 0.88,
+                'source_sentence': sentence,
+            })
+        else:
+            candidates.append({
+                'question': "What cause-and-effect relationship is described in this part of the passage?",
+                'template_type': 'cause_effect',
+                'confidence': 0.86,
+                'source_sentence': sentence,
+            })
+
+    # --- Temporal / historical (one per sentence) ---
+    if info['has_temporal']:
+        if info['has_numbers']:
+            num = info['numbers'][0]
+            candidates.append({
+                'question': f"What significance does the time reference '{num}' hold in the context of the passage?",
+                'template_type': 'temporal_significance',
+                'confidence': 0.82,
+                'source_sentence': sentence,
+            })
+        elif primary_entity:
+            candidates.append({
+                'question': f"What was happening before {primary_entity} according to the passage?",
+                'template_type': 'temporal_context',
+                'confidence': 0.78,
+                'source_sentence': sentence,
+            })
+
+    # --- Comparison / contrast (one per sentence) ---
+    if info['has_comparison']:
         candidates.append({
-            'question': f"What is {subject}?",
-            'template_type': 'entity_definition',
+            'question': "What contrast or comparison does the passage draw in this section?",
+            'template_type': 'comparison',
+            'confidence': 0.84,
+            'source_sentence': sentence,
+        })
+
+    # --- Process / mechanism (one per sentence) ---
+    if info['has_process']:
+        candidates.append({
+            'question': "What process or mechanism does the passage describe?",
+            'template_type': 'process',
+            'confidence': 0.80,
+            'source_sentence': sentence,
+        })
+
+    # --- Inference (one per sentence) ---
+    if info['word_count'] > 8 and primary_entity:
+        candidates.append({
+            'question': f"What can be inferred about {primary_entity} from the information provided in the passage?",
+            'template_type': 'inference',
+            'confidence': 0.82,
+            'source_sentence': sentence,
+        })
+
+    # --- Significance (one per sentence) ---
+    if info['word_count'] > 6 and primary_entity:
+        candidates.append({
+            'question': f"Why is {primary_entity} significant according to the passage?",
+            'template_type': 'significance',
+            'confidence': 0.78,
+            'source_sentence': sentence,
+        })
+
+    # --- Summarization (one per sentence, entity-free) ---
+    if info['word_count'] > 10:
+        candidates.append({
+            'question': "Which of the following best summarizes the key claim made in this part of the passage?",
+            'template_type': 'summarization',
             'confidence': 0.75,
-            'source_sentence': sentence
+            'source_sentence': sentence,
         })
-    
-    # Template 3: "How/Why is X important?"
-    if len(words) > 5:
-        candidates.append({
-            'question': f"According to the passage, what is the primary purpose or function?",
-            'template_type': 'purpose',
-            'confidence': 0.7,
-            'source_sentence': sentence
-        })
-    
-    # Template 4: "When/Where does X occur?"
-    if any(word in sentence.lower() for word in ['when', 'where', 'during', 'at', 'in']):
-        candidates.append({
-            'question': f"When or where does this event/concept occur?",
-            'template_type': 'time_location',
-            'confidence': 0.65,
-            'source_sentence': sentence
-        })
-    
-    # Template 5: Generic comprehension
-    candidates.append({
-        'question': f"What is the main idea discussed in this part?",
-        'template_type': 'general_comprehension',
-        'confidence': 0.6,
-        'source_sentence': sentence
-    })
-    
+
+    # --- Fallback: context-specific rather than fully generic ---
+    if not candidates:
+        if primary_entity:
+            candidates.append({
+                'question': f"What does the passage state about {primary_entity}?",
+                'template_type': 'entity_statement',
+                'confidence': 0.70,
+                'source_sentence': sentence,
+            })
+        else:
+            candidates.append({
+                'question': "What key detail does the passage emphasize in this section?",
+                'template_type': 'key_detail',
+                'confidence': 0.60,
+                'source_sentence': sentence,
+            })
+
     return candidates
 
 
@@ -257,6 +431,149 @@ def generate_question_ai(article: str) -> Tuple[str, str]:
     STEP 3: Rank with Model A (SVM/RF ensemble)
     """
     return generate_question_with_models(article)
+
+
+def _normalize_question_text(question: str) -> str:
+    """Normalize question text for deduplication."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s?]', '', question.lower())).strip()
+
+
+def _extract_article_topic(article: str) -> str:
+    """Extract a lightweight topic phrase from the article for fallback questions."""
+    sentences = [s.strip() for s in article.split('.') if s.strip()]
+    if not sentences:
+        return "the passage"
+
+    # Try to find a meaningful named entity from the first sentence
+    entities = _extract_entities(sentences[0])
+    if entities:
+        return entities[0]
+
+    # Fallback: pick a few meaningful words from the first sentence
+    stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in',
+                 'to', 'and', 'for', 'on', 'at', 'by', 'with', 'from', 'that',
+                 'this', 'it', 'its', 'as', 'or', 'be', 'has', 'had', 'have'}
+    words = [word.strip('.,;:') for word in sentences[0].split()
+             if len(word.strip('.,;:')) > 3 and word.strip('.,;:').lower() not in stopwords]
+    if words:
+        return ' '.join(words[:3])
+
+    return "the passage"
+
+
+def generate_10_unique_questions(article: str, model_a_inference=None, num_questions: int = 10) -> List[Dict]:
+    """
+    Generate a set of 10 distinct questions from the same article.
+
+    The set is built from the most important sentences, ranked candidates,
+    and article-aware fallback templates if the text is short or repetitive.
+    """
+    important_sentences = extract_important_sentences(article, top_k=5)
+    ranked_questions = []
+    seen_questions = set()
+
+    for sentence, sentence_score in important_sentences:
+        candidates = generate_question_candidates(sentence)
+
+        for candidate in candidates:
+            question_text = candidate['question'].strip()
+            normalized = _normalize_question_text(question_text)
+
+            if not question_text or normalized in seen_questions:
+                continue
+
+            seen_questions.add(normalized)
+
+            combined_score = float(candidate.get('confidence', 0.0)) + (float(sentence_score) * 0.05)
+            if model_a_inference and candidate.get('template_type') in {'entity_role', 'cause_effect', 'inference', 'consequence'}:
+                combined_score += 0.1
+
+            ranked_questions.append({
+                'question': question_text,
+                'template_type': candidate.get('template_type', 'unknown'),
+                'confidence': float(candidate.get('confidence', 0.0)),
+                'combined_score': combined_score,
+                'source_sentence': sentence,
+                'source_sentence_score': float(sentence_score),
+            })
+
+    ranked_questions.sort(key=lambda item: (item['combined_score'], len(item['question'])), reverse=True)
+
+    if len(ranked_questions) < num_questions:
+        article_topic = _extract_article_topic(article)
+        fallback_templates = [
+            f"What can be inferred about {article_topic} from the passage?",
+            f"What evidence does the passage provide to support its claims about {article_topic}?",
+            f"How does the passage explain the significance of {article_topic}?",
+            f"What would most likely happen if {article_topic} had not existed, based on the passage?",
+            f"Which claim about {article_topic} is best supported by the passage?",
+            f"What underlying assumption does the passage make about {article_topic}?",
+            f"What cause-and-effect relationship involving {article_topic} is described?",
+            f"What distinction does the passage draw regarding {article_topic}?",
+            f"What broader impact of {article_topic} is discussed in the passage?",
+            f"What conclusion about {article_topic} can be drawn from the passage?",
+        ]
+
+        fallback_sources = important_sentences or [(article[:120].strip(), 1.0)]
+        source_cycle = 0
+
+        for template in fallback_templates:
+            if len(ranked_questions) >= num_questions:
+                break
+
+            source_sentence = fallback_sources[source_cycle % len(fallback_sources)][0]
+            source_cycle += 1
+            normalized = _normalize_question_text(template)
+
+            if normalized in seen_questions:
+                continue
+
+            seen_questions.add(normalized)
+            ranked_questions.append({
+                'question': template,
+                'template_type': 'fallback',
+                'confidence': 0.5,
+                'combined_score': 0.5,
+                'source_sentence': source_sentence,
+                'source_sentence_score': 1.0,
+            })
+
+    # Final dedupe pass while preserving order after ranking.
+    deduped_questions = []
+    seen_final = set()
+    for item in ranked_questions:
+        normalized = _normalize_question_text(item['question'])
+        if normalized in seen_final:
+            continue
+        seen_final.add(normalized)
+        deduped_questions.append(item)
+        if len(deduped_questions) >= num_questions:
+            break
+
+    return deduped_questions[:num_questions]
+
+
+def build_question_bundle(article: str, question_item: Dict, model_a_inference=None) -> Dict:
+    """Build a complete question bundle with answer and distractors."""
+    question = question_item['question']
+    answer = generate_answer_from_question(article, question)
+    distractors = generate_distractors(question, answer, article)
+
+    options = distractors.copy()
+    correct_idx = random.randint(0, 3)
+    options.insert(correct_idx, answer)
+
+    return {
+        'question': question,
+        'template_type': question_item.get('template_type', 'unknown'),
+        'confidence': question_item.get('confidence', 0.0),
+        'combined_score': question_item.get('combined_score', 0.0),
+        'source_sentence': question_item.get('source_sentence', ''),
+        'answer': answer,
+        'options': options,
+        'correct_answer': correct_idx,
+        'distractors': distractors,
+    }
 
 
 def extract_answer_candidates(article: str, question: str) -> List[str]:
@@ -496,24 +813,33 @@ def load_model_generated_questions_mode(article: str, model_a_inference=None) ->
     - User can review/edit or proceed directly to quiz
     - Models evaluate Q&A quality
     """
-    # Generate question using 3-step pipeline
-    question, question_hint = generate_question_with_models(article, model_a_inference)
-    
-    # Generate answer from article
-    answer = generate_answer_from_question(article, question)
-    
-    # Generate distractors
-    distractors = generate_distractors(question, answer, article)
-    
-    # Shuffle options with answer
-    options = distractors.copy()
-    correct_idx = random.randint(0, 3)
-    options.insert(correct_idx, answer)
+    # Generate a set of 10 unique questions using the 3-step pipeline
+    generated_questions = generate_10_unique_questions(article, model_a_inference, num_questions=10)
+
+    question_bundles = [build_question_bundle(article, item, model_a_inference) for item in generated_questions]
+
+    active_bundle = question_bundles[0] if question_bundles else {
+        'question': 'What is the main idea of this passage?',
+        'source_sentence': article[:75],
+        'answer': generate_answer_from_question(article, 'What is the main idea of this passage?'),
+        'options': ['Option 1', 'Option 2', 'Option 3', 'Option 4'],
+        'correct_answer': 0,
+        'distractors': [],
+    }
+
+    question = active_bundle['question']
+    question_hint = f"Hint: Based on - '{active_bundle['source_sentence'][:75]}...'" if active_bundle.get('source_sentence') else "Could not analyze article"
+    answer = active_bundle['answer']
+    distractors = active_bundle['distractors']
+    options = active_bundle['options']
+    correct_idx = active_bundle['correct_answer']
     
     return {
         'mode': 'model_generated',
         'article': article,
         'question': question,
+        'generated_questions': generated_questions,
+        'question_bundles': question_bundles,
         'question_hint': question_hint,
         'answer': answer,
         'options': options,
@@ -586,19 +912,28 @@ def load_user_provided_mode(article: str = '') -> Dict:
 # =============================================================================
 
 def get_random_article() -> str:
-    """Get a random article from the sample dataset."""
-    return random.choice(SAMPLE_ARTICLES)
+    """Get a random article from the local dataset pool."""
+    return random.choice(get_all_articles())
 
 
 def get_all_articles() -> List[str]:
-    """Get all sample articles."""
-    return SAMPLE_ARTICLES
+    """Get all local articles used by the app."""
+    combined = list(SAMPLE_ARTICLES)
+
+    for qa_pair in RACE_SAMPLE_QA:
+        article = qa_pair.get('article', '').strip()
+        if article and article not in combined:
+            combined.append(article)
+
+    return combined
 
 
 def get_article_by_index(index: int) -> str:
     """Get a specific article by index."""
-    if 0 <= index < len(SAMPLE_ARTICLES):
-        return SAMPLE_ARTICLES[index]
+    articles = get_all_articles()
+
+    if 0 <= index < len(articles):
+        return articles[index]
     return get_random_article()
 
 
