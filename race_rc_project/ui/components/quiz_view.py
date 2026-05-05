@@ -192,6 +192,7 @@ def render_quiz_view_buttons(active_question):
                 )
 
             st.session_state.hints = hints
+            st.session_state.hints_revealed = 0
             set_screen('hint_panel')
             st.rerun()
     

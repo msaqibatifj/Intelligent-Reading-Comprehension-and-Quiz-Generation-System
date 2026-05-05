@@ -99,10 +99,12 @@ def extract_important_sentences(article: str, top_k: int = 3) -> List[Tuple[str,
 def _extract_entities(sentence: str) -> List[str]:
     """Extract meaningful named entities from a sentence.
 
-    Filters out common sentence-starting words, articles, pronouns,
-    conjunctions, and other non-entity capitalized words.
-    Also strips possessive suffixes ('s) and merges partial matches
+    Handles compound nouns that start with a capital letter at sentence
+    boundaries (e.g. "Machine learning", "Climate change") by extending
+    into the following lowercase word(s).
+    Strips possessive suffixes ('s) and merges partial matches
     (e.g. "Gutenberg" merges into "Johannes Gutenberg").
+    Filters out single common-word entities that are not proper nouns.
     """
     STOPWORDS = {
         'the', 'this', 'that', 'these', 'those', 'a', 'an',
@@ -124,6 +126,26 @@ def _extract_entities(sentence: str) -> List[str]:
         'for', 'about', 'between', 'through', 'under', 'above',
     }
 
+    # Common English words that should NOT be standalone entities.
+    # If a single-word entity matches one of these (case-insensitive), skip it.
+    COMMON_WORDS = {
+        'machine', 'climate', 'concept', 'evidence', 'example',
+        'result', 'effect', 'process', 'system', 'model', 'method',
+        'type', 'form', 'kind', 'part', 'role', 'point', 'case',
+        'way', 'time', 'place', 'world', 'life', 'work', 'idea',
+        'fact', 'thing', 'group', 'number', 'problem', 'change',
+        'state', 'level', 'field', 'area', 'end', 'line', 'side',
+        'head', 'hand', 'house', 'water', 'light', 'story', 'air',
+        'power', 'force', 'matter', 'order', 'nature', 'class',
+        'data', 'information', 'knowledge', 'production', 'structure',
+        'function', 'action', 'science', 'research', 'development',
+        'technology', 'society', 'history', 'culture', 'movement',
+        'construction', 'printing', 'learning', 'reading', 'writing',
+        'energy', 'material', 'source', 'base', 'food', 'cell',
+        'gene', 'organism', 'species', 'plant', 'animal', 'earth',
+        'sun', 'moon', 'star', 'space', 'network', 'communication',
+    }
+
     words = sentence.split()
     raw_entities = []
     i = 0
@@ -132,9 +154,22 @@ def _extract_entities(sentence: str) -> List[str]:
         # Strip possessive suffix
         if word_clean.endswith("'s") or word_clean.endswith("\u2019s"):
             word_clean = word_clean[:-2]
-        if (len(word_clean) > 1
-                and word_clean[0].isupper()
-                and word_clean.lower() not in STOPWORDS):
+
+        # Accept a capitalised word even when it is in STOPWORDS if the
+        # *next* word is also capitalised (handles "Great Wall", "New York").
+        is_start_of_proper = (
+            len(word_clean) > 1
+            and word_clean[0].isupper()
+            and word_clean.lower() not in STOPWORDS
+        )
+        if not is_start_of_proper and len(word_clean) > 1 and word_clean[0].isupper():
+            # Peek ahead: if the next word is also capitalised, include this
+            if i + 1 < len(words):
+                peek = words[i + 1].strip('.,;:!?\'"()-')
+                if len(peek) > 1 and peek[0].isupper() and peek.lower() not in STOPWORDS:
+                    is_start_of_proper = True
+
+        if is_start_of_proper:
             # Greedily collect multi-word entity (consecutive capitalized words)
             entity_parts = [word_clean]
             j = i + 1
@@ -147,24 +182,55 @@ def _extract_entities(sentence: str) -> List[str]:
                         and next_clean.lower() not in STOPWORDS):
                     entity_parts.append(next_clean)
                     j += 1
+                # Bridge through short connectors like "of", "the", "and"
+                # when followed by another capitalised word ("Wall of China")
+                elif (next_clean.lower() in ('of', 'the', 'and', 'de', 'del', 'von')
+                      and j + 1 < len(words)):
+                    peek2 = words[j + 1].strip('.,;:!?\'"()-')
+                    if len(peek2) > 1 and peek2[0].isupper():
+                        entity_parts.append(next_clean)
+                        entity_parts.append(peek2)
+                        j += 2
+                    else:
+                        break
                 else:
                     break
+
+            # If the entity is a single capitalized word, try extending into
+            # the next lowercase word to capture compound nouns like
+            # "Machine learning", "Climate change", "Natural selection".
+            if len(entity_parts) == 1 and j < len(words):
+                next_lower = words[j].strip('.,;:!?\'"()-')
+                if (len(next_lower) > 2
+                        and next_lower[0].islower()
+                        and next_lower.lower() not in STOPWORDS):
+                    entity_parts.append(next_lower)
+                    j += 1
+
             entity = ' '.join(entity_parts)
             raw_entities.append(entity)
             i = j
         else:
             i += 1
 
+    # Filter: remove single-word entities that are common English words
+    filtered = []
+    for entity in raw_entities:
+        if ' ' not in entity and entity.lower() in COMMON_WORDS:
+            continue
+        # Also skip very short single-word entities (2 chars)
+        if ' ' not in entity and len(entity) <= 2:
+            continue
+        filtered.append(entity)
+    raw_entities = filtered
+
     # Merge: if a shorter entity is a substring of a longer one, keep only the longer
     # e.g. "Gutenberg" is absorbed by "Johannes Gutenberg"
     merged = []
-    # Sort longest first so we check against longest entities first
     sorted_entities = sorted(raw_entities, key=len, reverse=True)
     for entity in sorted_entities:
-        # Check if this entity is already a substring of an entity we kept
         if any(entity in kept and entity != kept for kept in merged):
             continue
-        # Check if we already have a duplicate
         if entity in merged:
             continue
         merged.append(entity)
@@ -172,7 +238,6 @@ def _extract_entities(sentence: str) -> List[str]:
     # Return in original discovery order
     ordered = []
     for entity in raw_entities:
-        # Find the merged version that contains this entity
         for kept in merged:
             if entity in kept and kept not in ordered:
                 ordered.append(kept)
@@ -207,6 +272,10 @@ def _extract_key_phrases(sentence: str) -> Dict:
             'process', 'method', 'technique', 'step', 'stage',
             'through', 'by', 'using', 'via', 'involves',
         ]),
+        'has_list': any(w in lower for w in [
+            'three main', 'two types', 'several', 'include',
+            'such as', 'for example', 'types:', 'stages:',
+        ]),
         'word_count': len(words),
     }
     return info
@@ -215,21 +284,31 @@ def _extract_key_phrases(sentence: str) -> Dict:
 def generate_question_candidates(sentence: str) -> List[Dict]:
     """
     STEP 2: Generate Wh-question candidates from a sentence using templates.
-    
-    Applies context-aware question templates to produce specific, complex
-    questions rather than generic ones. Uses only ONE entity per template
-    type to avoid repetitive questions across the set.
+
+    Each template type is semantically distinct from the others.
+    Questions reference specific content from the sentence rather than
+    using vague, generic phrasing.
     """
     candidates = []
     info = _extract_key_phrases(sentence)
     entities = info['entities']
-    # Pick the single best (longest / most specific) entity for this sentence
     primary_entity = entities[0] if entities else None
+    lower = sentence.lower()
 
-    # --- ONE entity-specific question per sentence (using the best entity) ---
+    # --- Entity role (one per sentence) ---
     if primary_entity:
+        # Make the question content-specific based on sentence structure
+        if any(w in lower for w in ['made of', 'composed of', 'constructed',
+                                     'built from', 'consists of']):
+            q = f"What materials or components make up {primary_entity} according to the passage?"
+        elif any(w in lower for w in ['protect', 'defend', 'guard', 'prevent']):
+            q = f"What was {primary_entity} built to do, according to the passage?"
+        elif ' is ' in lower or ' are ' in lower or ' was ' in lower:
+            q = f"How does the passage describe {primary_entity}?"
+        else:
+            q = f"What does the passage tell us about {primary_entity}?"
         candidates.append({
-            'question': f"According to the passage, what role does {primary_entity} play in the events described?",
+            'question': q,
             'template_type': 'entity_role',
             'confidence': 0.85,
             'source_sentence': sentence,
@@ -239,7 +318,7 @@ def generate_question_candidates(sentence: str) -> List[Dict]:
     if info['has_cause_effect']:
         if primary_entity:
             candidates.append({
-                'question': f"What was the direct consequence of {primary_entity} as described in the passage?",
+                'question': f"According to the passage, what effect or outcome resulted from {primary_entity}?",
                 'template_type': 'cause_effect',
                 'confidence': 0.88,
                 'source_sentence': sentence,
@@ -256,15 +335,20 @@ def generate_question_candidates(sentence: str) -> List[Dict]:
     if info['has_temporal']:
         if info['has_numbers']:
             num = info['numbers'][0]
+            # Make temporal question specific to the event
+            if primary_entity:
+                q = f"According to the passage, what happened involving {primary_entity} around the time period '{num}'?"
+            else:
+                q = f"What event or milestone is associated with the figure '{num}' in the passage?"
             candidates.append({
-                'question': f"What significance does the time reference '{num}' hold in the context of the passage?",
+                'question': q,
                 'template_type': 'temporal_significance',
                 'confidence': 0.82,
                 'source_sentence': sentence,
             })
         elif primary_entity:
             candidates.append({
-                'question': f"What was happening before {primary_entity} according to the passage?",
+                'question': f"What historical context does the passage provide about {primary_entity}?",
                 'template_type': 'temporal_context',
                 'confidence': 0.78,
                 'source_sentence': sentence,
@@ -281,41 +365,67 @@ def generate_question_candidates(sentence: str) -> List[Dict]:
 
     # --- Process / mechanism (one per sentence) ---
     if info['has_process']:
+        if primary_entity:
+            q = f"What process or method involving {primary_entity} does the passage describe?"
+        else:
+            q = "What process or mechanism does the passage describe in this section?"
         candidates.append({
-            'question': "What process or mechanism does the passage describe?",
+            'question': q,
             'template_type': 'process',
             'confidence': 0.80,
             'source_sentence': sentence,
         })
 
-    # --- Inference (one per sentence) ---
-    if info['word_count'] > 8 and primary_entity:
+    # --- List / enumeration questions ---
+    if info['has_list']:
         candidates.append({
-            'question': f"What can be inferred about {primary_entity} from the information provided in the passage?",
+            'question': "What specific categories or types does the passage identify?",
+            'template_type': 'enumeration',
+            'confidence': 0.83,
+            'source_sentence': sentence,
+        })
+
+    # --- Inference (only when sentence implies purpose/consequence) ---
+    if info['word_count'] > 10 and primary_entity:
+        if any(w in lower for w in ['to protect', 'to prevent', 'to enable',
+                                     'to create', 'to support', 'purpose']):
+            q = f"Based on the passage, what was the primary purpose of {primary_entity}?"
+        elif any(w in lower for w in ['important', 'significant', 'iconic',
+                                       'revolutionary', 'crucial']):
+            q = f"Why is {primary_entity} considered important according to the passage?"
+        else:
+            q = f"What conclusion about {primary_entity} can be drawn from the passage?"
+        candidates.append({
+            'question': q,
             'template_type': 'inference',
             'confidence': 0.82,
             'source_sentence': sentence,
         })
 
-    # --- Significance (one per sentence) ---
-    if info['word_count'] > 6 and primary_entity:
+    # --- Summarization (content-aware) ---
+    if info['word_count'] > 12:
+        if primary_entity:
+            q = f"Which statement best captures the passage's main point about {primary_entity}?"
+        else:
+            q = "Which of the following best summarizes the key claim made in this part of the passage?"
         candidates.append({
-            'question': f"Why is {primary_entity} significant according to the passage?",
-            'template_type': 'significance',
-            'confidence': 0.78,
-            'source_sentence': sentence,
-        })
-
-    # --- Summarization (one per sentence, entity-free) ---
-    if info['word_count'] > 10:
-        candidates.append({
-            'question': "Which of the following best summarizes the key claim made in this part of the passage?",
+            'question': q,
             'template_type': 'summarization',
             'confidence': 0.75,
             'source_sentence': sentence,
         })
 
-    # --- Fallback: context-specific rather than fully generic ---
+    # --- Key detail (number/fact-focused) ---
+    if info['has_numbers'] and not info['has_temporal']:
+        num = info['numbers'][0]
+        candidates.append({
+            'question': f"What specific measurement or quantity does the passage mention ('{num}')?",
+            'template_type': 'key_detail',
+            'confidence': 0.80,
+            'source_sentence': sentence,
+        })
+
+    # --- Fallback ---
     if not candidates:
         if primary_entity:
             candidates.append({
@@ -538,14 +648,21 @@ def generate_10_unique_questions(article: str, model_a_inference=None, num_quest
                 'source_sentence_score': 1.0,
             })
 
-    # Final dedupe pass while preserving order after ranking.
+    # Final dedupe pass: preserve order, enforce template-type diversity.
+    # Allow at most MAX_PER_TYPE questions of the same template_type.
+    MAX_PER_TYPE = 1
     deduped_questions = []
     seen_final = set()
+    type_counts: Dict[str, int] = {}
     for item in ranked_questions:
         normalized = _normalize_question_text(item['question'])
         if normalized in seen_final:
             continue
+        ttype = item.get('template_type', 'unknown')
+        if type_counts.get(ttype, 0) >= MAX_PER_TYPE:
+            continue
         seen_final.add(normalized)
+        type_counts[ttype] = type_counts.get(ttype, 0) + 1
         deduped_questions.append(item)
         if len(deduped_questions) >= num_questions:
             break
@@ -553,11 +670,75 @@ def generate_10_unique_questions(article: str, model_a_inference=None, num_quest
     return deduped_questions[:num_questions]
 
 
-def build_question_bundle(article: str, question_item: Dict, model_a_inference=None) -> Dict:
-    """Build a complete question bundle with answer and distractors."""
+def _is_substring_overlap(a: str, b: str, threshold: float = 0.8) -> bool:
+    """Return True if *a* is substantially contained in *b* or vice-versa."""
+    a_lower, b_lower = a.lower().strip(), b.lower().strip()
+    shorter, longer = (a_lower, b_lower) if len(a_lower) <= len(b_lower) else (b_lower, a_lower)
+    if not shorter:
+        return True
+    if shorter in longer:
+        return True
+    # Word-overlap ratio
+    s_words = set(shorter.split())
+    l_words = set(longer.split())
+    if s_words and len(s_words & l_words) / len(s_words) >= threshold:
+        return True
+    return False
+
+
+def build_question_bundle(article: str, question_item: Dict, model_a_inference=None,
+                          used_answers: Optional[set] = None,
+                          used_distractors: Optional[set] = None) -> Optional[Dict]:
+    """Build a complete question bundle with answer and distractors.
+
+    Uses template-type-aware extraction so that different question types
+    naturally pull different parts of the source sentence as the answer.
+    If *used_answers* / *used_distractors* are provided, ensures uniqueness
+    across questions.  Returns ``None`` when no unique answer can be found.
+    """
     question = question_item['question']
-    answer = generate_answer_from_question(article, question)
-    distractors = generate_distractors(question, answer, article)
+    source_sentence = question_item.get('source_sentence', '')
+    template_type = question_item.get('template_type', '')
+
+    # 1) Type-aware candidates first (best diversity)
+    candidates = _extract_type_aware_answer(
+        source_sentence, template_type, question, article)
+
+    # 2) Also collect general TF-IDF candidates (biased toward source)
+    general = extract_answer_candidates(article, question, source_sentence)
+    for g in general:
+        cleaned = _clean_answer(g)
+        if cleaned not in candidates:
+            candidates.append(cleaned)
+
+    # 3) Pick the first candidate whose normalised form is not already used
+    answer = None
+    if used_answers is not None:
+        for cand in candidates:
+            norm = _normalize_answer(cand)
+            if norm not in used_answers and not any(_is_substring_overlap(cand, ex) for ex in used_answers):
+                answer = cand
+                break
+
+    # 4) Fallback — pipeline answer with type awareness
+    if answer is None:
+        answer = generate_answer_from_question(
+            article, question, source_sentence, template_type)
+
+    # 5) If still a duplicate, try the raw source sentence
+    if used_answers is not None:
+        norm = _normalize_answer(answer)
+        if norm in used_answers or any(_is_substring_overlap(answer, ex) for ex in used_answers):
+            source = question_item.get('source_sentence', '')
+            if source and _normalize_answer(source) not in used_answers and not any(_is_substring_overlap(source, ex) for ex in used_answers):
+                answer = _clean_answer(source)
+            else:
+                return None  # cannot produce a unique answer
+
+    distractors = generate_distractors(
+        question, answer, article,
+        used_answers=used_answers,
+        used_distractors=used_distractors)
 
     options = distractors.copy()
     correct_idx = random.randint(0, 3)
@@ -576,88 +757,226 @@ def build_question_bundle(article: str, question_item: Dict, model_a_inference=N
     }
 
 
-def extract_answer_candidates(article: str, question: str) -> List[str]:
+def _normalize_answer(text: str) -> str:
+    """Normalize an answer string for deduplication."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text.lower())).strip()
+
+
+def _clean_answer(candidate: str, max_words: int = 15) -> str:
+    """Clean up a raw candidate sentence into a concise answer.
+
+    Caps the answer at *max_words* to keep options concise and
+    prevent different-length cuts of the same sentence.
+    """
+    words = candidate.split()
+    answer = ' '.join(words[:min(max_words, len(words))]).strip()
+    return answer.rstrip('.,;:') if answer else candidate
+
+
+def _extract_type_aware_answer(source_sentence: str, template_type: str,
+                               question: str, article: str) -> List[str]:
+    """Extract answer candidates based on the question's template type.
+
+    Different question types naturally demand different parts of the source
+    sentence as the answer, which prevents multiple questions from sharing
+    the same answer string.
+
+    Returns a list of candidate answers ordered best-to-worst.
+    """
+    candidates: List[str] = []
+    if not source_sentence:
+        return candidates
+
+    # --- Type-specific extraction from source sentence ---
+    if template_type == 'entity_role':
+        # Extract what the entity IS or DOES
+        for pattern in [r'\bis\b(.+)', r'\bare\b(.+)', r'\bwas\b(.+)', r'\bwere\b(.+)']:
+            match = re.search(pattern, source_sentence, re.IGNORECASE)
+            if match:
+                candidates.append(match.group(1).strip().rstrip('.,;:'))
+                break
+
+    elif template_type == 'cause_effect':
+        for marker in ['led to', 'caused', 'resulted in', 'because',
+                       'therefore', 'allowed for', 'played a crucial role',
+                       'contributed to', 'enabled']:
+            if marker in source_sentence.lower():
+                idx = source_sentence.lower().index(marker)
+                candidates.append(source_sentence[idx:].strip().rstrip('.,;:'))
+                break
+
+    elif template_type == 'temporal_significance':
+        numbers = re.findall(r'\b\d[\d,]*\b', source_sentence)
+        for num in numbers:
+            idx = source_sentence.index(num)
+            start = max(0, source_sentence.rfind(' ', 0, max(0, idx - 20)))
+            end = source_sentence.find('.', idx + len(num))
+            if end == -1:
+                end = len(source_sentence)
+            candidates.append(source_sentence[start:end].strip().rstrip('.,;:'))
+
+    elif template_type == 'process':
+        for marker in ['by ', 'through ', 'using ', 'via ', 'involves ']:
+            if marker in source_sentence.lower():
+                idx = source_sentence.lower().index(marker)
+                candidates.append(source_sentence[idx:].strip().rstrip('.,;:'))
+                break
+
+    elif template_type in ('inference', 'fallback'):
+        # For inference, extract purpose/function phrases
+        for marker in ['to protect', 'to create', 'to ', 'for ', 'in order to ']:
+            if marker in source_sentence.lower():
+                idx = source_sentence.lower().index(marker)
+                candidates.append(source_sentence[idx:].strip().rstrip('.,;:'))
+                break
+
+    elif template_type == 'summarization':
+        words = source_sentence.split()
+        candidates.append(' '.join(words[:25]).strip().rstrip('.,;:'))
+
+    elif template_type == 'key_detail':
+        numbers = re.findall(r'\b\d[\d,]*\b', source_sentence)
+        if numbers:
+            for num in numbers:
+                idx = source_sentence.index(num)
+                start = max(0, source_sentence.rfind(' ', 0, max(0, idx - 15)))
+                end = min(len(source_sentence), idx + len(num) + 40)
+                candidates.append(source_sentence[start:end].strip().rstrip('.,;:'))
+        entities = _extract_entities(source_sentence)
+        for ent in entities:
+            candidates.append(ent)
+
+    elif template_type == 'enumeration':
+        for marker in ['include', 'such as', 'types:', 'stages:',
+                       'three main', 'two ']:
+            if marker in source_sentence.lower():
+                idx = source_sentence.lower().index(marker)
+                candidates.append(source_sentence[idx:].strip().rstrip('.,;:'))
+                break
+
+    elif template_type == 'comparison':
+        for marker in ['unlike', 'compared to', 'whereas', 'while',
+                       'however', 'in contrast', 'rather than']:
+            if marker in source_sentence.lower():
+                idx = source_sentence.lower().index(marker)
+                candidates.append(source_sentence[idx:].strip().rstrip('.,;:'))
+                break
+
+    # --- Fallback: split by commas/semicolons for clause-level candidates ---
+    clauses = re.split(r'[,;]', source_sentence)
+    meaningful = [c.strip().rstrip('.,;:') for c in clauses
+                  if len(c.strip().split()) >= 4]
+    candidates.extend(meaningful)
+
+    # --- Last resort: full sentence capped at 15 words ---
+    words = source_sentence.split()
+    full = ' '.join(words[:15]).strip().rstrip('.,;:')
+    if full not in candidates:
+        candidates.append(full)
+
+    # Filter out empty / too-short candidates and cap each at 15 words
+    cleaned: List[str] = []
+    for c in candidates:
+        if not c or len(c.split()) < 3:
+            continue
+        w = c.split()
+        cleaned.append(' '.join(w[:15]).strip().rstrip('.,;:'))
+    return cleaned
+
+
+def extract_answer_candidates(article: str, question: str,
+                              source_sentence: str = '') -> List[str]:
     """
     Extract answer candidates from the article based on the question.
-    
-    Uses heuristics to find relevant phrases that could be the answer:
-    - Extracts sentences containing key question words
-    - Extracts noun phrases from important sentences
-    - Returns top candidates ranked by relevance
+
+    If *source_sentence* is provided it is placed first so that the
+    question's own source material is preferred over globally similar
+    sentences (which tend to be the same top sentence for every question).
     """
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
     except ImportError:
+        if source_sentence:
+            return [source_sentence]
         return []
-    
+
     sentences = [s.strip() for s in article.split('.') if s.strip()]
     if not sentences:
-        return []
-    
+        return [source_sentence] if source_sentence else []
+
     try:
-        # Vectorize question and sentences
         texts = [question] + sentences
         vectorizer = TfidfVectorizer(max_features=50, stop_words='english')
         tfidf_matrix = vectorizer.fit_transform(texts)
-        
-        # Calculate similarity between question and each sentence
+
         question_vec = tfidf_matrix[0]
         sentence_vecs = tfidf_matrix[1:]
         similarities = cosine_similarity(question_vec, sentence_vecs).ravel()
-        
-        # Get top-3 sentences by similarity (potential answers)
-        top_indices = np.argsort(-similarities)[:3]
+
+        top_indices = np.argsort(-similarities)[:5]
         candidates = [sentences[i].strip() for i in top_indices if similarities[i] > 0.1]
-        
-        return candidates[:3]
+
+        # Prioritize the question's own source sentence
+        if source_sentence:
+            src_clean = source_sentence.strip()
+            candidates = [c for c in candidates if c != src_clean]
+            candidates.insert(0, src_clean)
+
+        return candidates[:5]
     except Exception:
-        # Fallback: return first few sentences
+        if source_sentence:
+            return [source_sentence]
         return sentences[:2]
 
 
-def generate_answer_from_question(article: str, question: str) -> str:
+def generate_answer_from_question(article: str, question: str,
+                                  source_sentence: str = '',
+                                  template_type: str = '') -> str:
     """
     Generate the best answer from the article based on the question.
-    
-    STEP 1: Find sentences most similar to question (TF-IDF cosine similarity)
-    STEP 2: Extract key phrases/entities from top sentences
-    STEP 3: Rank and return best candidate
+
+    When *source_sentence* and *template_type* are provided, uses
+    type-aware extraction first so that different question types
+    naturally produce different answers.
     """
-    candidates = extract_answer_candidates(article, question)
-    
+    # Try type-aware extraction first
+    if source_sentence and template_type:
+        type_candidates = _extract_type_aware_answer(
+            source_sentence, template_type, question, article)
+        if type_candidates:
+            return type_candidates[0]
+
+    candidates = extract_answer_candidates(article, question, source_sentence)
+
     if not candidates:
-        # Fallback: use first sentence
         sentences = [s.strip() for s in article.split('.') if s.strip()]
         if sentences:
-            return sentences[0]
+            return _clean_answer(sentences[0])
         return "Unable to generate answer"
-    
-    # Use the most similar sentence as the answer source
-    best_candidate = candidates[0]
-    
-    # Clean up - extract key phrase (first 20-30 words or until comma)
-    if ',' in best_candidate:
-        answer = best_candidate.split(',')[0].strip()
-    else:
-        words = best_candidate.split()
-        answer = ' '.join(words[:min(20, len(words))]).strip()
-    
-    return answer.rstrip('.,;:') if answer else candidates[0]
+
+    return _clean_answer(candidates[0])
 
 
-def generate_distractors(question: str, answer: str, article: str) -> List[str]:
+def generate_distractors(question: str, answer: str, article: str,
+                         used_answers: Optional[set] = None,
+                         used_distractors: Optional[set] = None) -> List[str]:
     """
     Generate 3 plausible distractor (wrong) options that are SIMILAR to the answer.
-    
-    Strategies (in order of priority):
-    1. Find meaningful phrases from article semantically similar to answer (cosine similarity)
-    2. Extract sentences/clauses that are similar in length and structure to answer
-    3. Create contextual variations (related but wrong)
-    
-    Goal: Distractors should be plausible wrong answers with reasonable length (3-15 words).
+
+    When *used_answers* / *used_distractors* are supplied, candidates that
+    overlap with previously used answers or distractors across other questions
+    are filtered out so each question gets distinct options.
     """
     import re
+
+    # Build exclusion set from already-used answers and distractors
+    _excluded: set = set()
+    if used_answers:
+        _excluded.update(used_answers)
+    if used_distractors:
+        _excluded.update(used_distractors)
+    _excluded.add(_normalize_answer(answer))
     
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -689,8 +1008,11 @@ def generate_distractors(question: str, answer: str, article: str) -> List[str]:
             # - Not too short (avoid single words)
             # - Prefer phrases similar length to answer (±5 words)
             if (3 <= len(words) <= 30 and 
-                phrase.lower() != answer.lower() and
+                not _is_substring_overlap(phrase, answer) and
                 len(phrase) > 10):  # Avoid very short phrases
+                # Skip if this phrase overlaps with previously used answers/distractors
+                if _excluded and any(_is_substring_overlap(phrase, ex) for ex in _excluded):
+                    continue
                 candidate_phrases.append(phrase)
     
     # Remove duplicates while preserving order
@@ -726,9 +1048,16 @@ def generate_distractors(question: str, answer: str, article: str) -> List[str]:
             # Sort by similarity score descending
             good_similarities.sort(key=lambda x: x[1], reverse=True)
             
-            # Extract top similar phrases as distractors
+            # Extract top similar phrases as distractors (normalised dedup)
+            seen_distractor_norms: set = set()
             for phrase, sim in good_similarities:
-                if phrase not in distractors and len(distractors) < 3:
+                if len(distractors) >= 3:
+                    break
+                if any(_is_substring_overlap(phrase, d) for d in distractors):
+                    continue
+                norm = _normalize_answer(phrase)
+                if norm not in seen_distractor_norms:
+                    seen_distractor_norms.add(norm)
                     distractors.append(phrase)
             
         except Exception as e:
@@ -737,15 +1066,21 @@ def generate_distractors(question: str, answer: str, article: str) -> List[str]:
     # Fallback: If not enough distractors, use whole sentences
     if len(distractors) < 3:
         for sent in sentences:
-            if (sent.lower() != answer.lower() and 
-                sent not in distractors and
-                10 < len(sent) < 200):  # Reasonable sentence length
-                # Truncate very long sentences
-                if len(sent) > 100:
-                    sent = sent[:100].rsplit(' ', 1)[0] + "..."
-                distractors.append(sent)
-                if len(distractors) >= 3:
-                    break
+            if len(distractors) >= 3:
+                break
+            if len(sent) <= 10 or len(sent) >= 200:
+                continue
+            if _is_substring_overlap(sent, answer):
+                continue
+            if any(_is_substring_overlap(sent, d) for d in distractors):
+                continue
+            if _excluded and any(_is_substring_overlap(sent, ex) for ex in _excluded):
+                continue
+            
+            # Truncate very long sentences
+            if len(sent) > 100:
+                sent = sent[:100].rsplit(' ', 1)[0] + "..."
+            distractors.append(sent)
     
     # Fallback: Generic contextual options if still not enough
     if len(distractors) < 3:
@@ -759,6 +1094,7 @@ def generate_distractors(question: str, answer: str, article: str) -> List[str]:
                 distractors.append(opt)
     
     return distractors[:3]
+
 
 
 def load_ai_generated_mode(article: str) -> Dict:
@@ -816,7 +1152,19 @@ def load_model_generated_questions_mode(article: str, model_a_inference=None) ->
     # Generate a set of 10 unique questions using the 3-step pipeline
     generated_questions = generate_10_unique_questions(article, model_a_inference, num_questions=10)
 
-    question_bundles = [build_question_bundle(article, item, model_a_inference) for item in generated_questions]
+    # Build bundles while enforcing unique answers AND distractors
+    used_answers: set = set()
+    used_distractors: set = set()
+    question_bundles: List[Dict] = []
+    for item in generated_questions:
+        bundle = build_question_bundle(article, item, model_a_inference,
+                                       used_answers=used_answers,
+                                       used_distractors=used_distractors)
+        if bundle is not None:
+            used_answers.add(_normalize_answer(bundle['answer']))
+            for d in bundle.get('distractors', []):
+                used_distractors.add(_normalize_answer(d))
+            question_bundles.append(bundle)
 
     active_bundle = question_bundles[0] if question_bundles else {
         'question': 'What is the main idea of this passage?',

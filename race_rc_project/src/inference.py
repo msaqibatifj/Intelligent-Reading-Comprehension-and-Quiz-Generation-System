@@ -8,6 +8,9 @@ from nltk.tokenize import sent_tokenize
 import joblib
 from pathlib import Path
 import nltk
+from scipy.sparse import csr_matrix, hstack
+
+from preprocessing import FeatureEngineer
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -31,8 +34,21 @@ class ModelAInference:
         """Load trained models from disk."""
         for model_name, path in model_paths.items():
             try:
-                self.models[model_name] = joblib.load(path)
-                print(f"[OK] Loaded {model_name} from {path}")
+                # Special handling for feature_engineer
+                if model_name == 'feature_engineer':
+                    self.feature_engineer = FeatureEngineer.load(path)
+                    self.models[model_name] = self.feature_engineer
+                    print(f"[OK] Loaded {model_name} from {path}")
+                else:
+                    loaded = joblib.load(path)
+                    self.models[model_name] = loaded
+                    
+                    # Also store with short name (e.g., 'lr_model' -> 'lr')
+                    if model_name.endswith('_model'):
+                        short_name = model_name.replace('_model', '')
+                        self.models[short_name] = loaded
+                    
+                    print(f"[OK] Loaded {model_name} from {path}")
             except FileNotFoundError as exc:
                 self.load_errors.append({
                     'model': model_name,
@@ -50,25 +66,104 @@ class ModelAInference:
                 })
                 print(f"[WARN] Failed to load {model_name} from {path}: {exc}")
     
-    def verify_answer(self, passage, question, option, method='ensemble'):
+    def predict_answer(self, passage, question, options, method='ensemble_voting_model'):
         """
-        Verify if an option is correct given passage and question.
-        Returns: (is_correct: bool, confidence: float, explanation: str)
+        Predict which option (0,1,2,3) is correct.
+        
+        Args:
+            passage: article text
+            question: question text
+            options: list of [option_A, option_B, option_C, option_D]
+            method: model to use ('ensemble_voting_model', 'lr_model', 'rf_model', etc.)
+        
+        Returns:
+            {
+                'predicted_option': 0-3,
+                'confidence': 0.0-1.0,
+                'probabilities': [prob_0, prob_1, prob_2, prob_3],
+                'explanation': str
+            }
         """
         if method not in self.models:
-            return False, 0.0, f"Model {method} not loaded."
+            return {
+                'predicted_option': None,
+                'confidence': 0.0,
+                'probabilities': [0, 0, 0, 0],
+                'explanation': f"Model {method} not loaded."
+            }
         
         model = self.models[method]
         
-        # Feature extraction would happen here
-        # For now, mock implementation
         try:
-            confidence = model.predict_proba([[0.5, 0.3, 0.2, 0.1]])[0, 1]
-            is_correct = confidence > 0.5
-            explanation = f"Model confidence: {confidence:.2%}"
-            return is_correct, confidence, explanation
+            # Ensure we have 4 options
+            if len(options) != 4:
+                return {
+                    'predicted_option': None,
+                    'confidence': 0.0,
+                    'probabilities': [0, 0, 0, 0],
+                    'explanation': f"Expected 4 options, got {len(options)}"
+                }
+            
+            # Extract features for all 4 options
+            if self.feature_engineer is not None:
+                # One-Hot features for each option
+                onehot_parts = []
+                for option in options:
+                    combined = question + ' ' + option
+                    onehot_feat = self.feature_engineer.transform_onehot([combined])
+                    onehot_parts.append(onehot_feat)
+                
+                # Stack one-hot features from all options
+                onehot_all = hstack(onehot_parts)
+                
+                # Lexical features for all options
+                lexical_all = self.feature_engineer.extract_lexical_features(
+                    question, options, passage
+                )
+                lexical_all_sparse = csr_matrix(lexical_all.flatten()).reshape(1, -1)
+                
+                # Combine all features
+                X = hstack([onehot_all, lexical_all_sparse])
+                X_dense = X.toarray()
+                
+                # Get prediction
+                predicted_option = model.predict(X_dense)[0]
+                pred_proba = model.predict_proba(X_dense)[0]
+                confidence = float(pred_proba[predicted_option])
+                
+            else:
+                # Fallback: random prediction
+                predicted_option = np.random.randint(0, 4)
+                confidence = 0.25
+                pred_proba = [0.25, 0.25, 0.25, 0.25]
+            
+            option_labels = ['A', 'B', 'C', 'D']
+            
+            return {
+                'predicted_option': int(predicted_option),
+                'predicted_letter': option_labels[predicted_option],
+                'confidence': float(confidence),
+                'probabilities': [float(p) for p in pred_proba],
+                'explanation': f"Predicted {option_labels[predicted_option]} (option {predicted_option}) with {confidence:.1%} confidence"
+            }
         except Exception as e:
-            return False, 0.0, f"Error: {str(e)}"
+            return {
+                'predicted_option': None,
+                'confidence': 0.0,
+                'probabilities': [0, 0, 0, 0],
+                'explanation': f"Error: {str(e)}"
+            }
+    
+    def verify_answer(self, passage, question, option, method='ensemble_voting_model'):
+        """
+        [LEGACY] Verify if an option is correct given passage and question.
+        Use predict_answer() instead for multi-class classification.
+        
+        Returns: (is_correct: bool, confidence: float, explanation: str)
+        """
+        # This method is kept for backward compatibility but returns dummy results
+        # Recommend using predict_answer() with all 4 options instead
+        return False, 0.0, "LEGACY METHOD - Use predict_answer() instead"
     
     def generate_question(self, passage, method='template'):
         """
