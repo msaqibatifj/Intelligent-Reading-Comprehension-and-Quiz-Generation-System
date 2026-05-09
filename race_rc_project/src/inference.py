@@ -10,7 +10,7 @@ from pathlib import Path
 import nltk
 from scipy.sparse import csr_matrix, hstack
 
-from preprocessing import FeatureEngineer
+from .preprocessing import FeatureEngineer
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -312,7 +312,6 @@ class UnifiedInference:
                     'model_predictions': {
                         'lr_model': {'pred': 1, 'confidence': 0.8},
                         'svm_model': {'pred': 1, 'confidence': 0.75},
-                        'nb_model': {'pred': 1, 'confidence': 0.65},
                         'rf_model': {'pred': 0, 'confidence': 0.6},
                         'xgb_model': {'pred': 1, 'confidence': 0.85},
                         'ensemble_voting': {'pred': 1, 'confidence': 0.7},

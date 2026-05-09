@@ -1182,11 +1182,15 @@ def load_model_generated_questions_mode(article: str, model_a_inference=None) ->
     options = active_bundle['options']
     correct_idx = active_bundle['correct_answer']
     
+    generated_question_items = question_bundles if question_bundles else [active_bundle]
+
     return {
         'mode': 'model_generated',
         'article': article,
         'question': question,
-        'generated_questions': generated_questions,
+        # Keep the full bundle for every generated item so each question carries
+        # its own answer/options instead of reusing the active bundle values.
+        'generated_questions': generated_question_items,
         'question_bundles': question_bundles,
         'question_hint': question_hint,
         'answer': answer,

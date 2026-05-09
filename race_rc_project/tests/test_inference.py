@@ -2,9 +2,13 @@
 Integration tests for Model A and Model B inference.
 Run with: pytest tests/test_inference.py -v
 """
+import os
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Local: run from the repo root.
+# Kaggle: set the notebook working directory to the project root.
+sys.path.insert(0, str(Path(os.getcwd()).resolve()))
 
 import pytest
 import numpy as np
@@ -214,4 +218,4 @@ class TestFeatureEngineering:
 
 # Run tests
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main(["tests/test_inference.py", "-v"])

@@ -83,24 +83,38 @@ race_rc_project/
 
 ## Quick Start
 
-### 1. Run Streamlit App (UI only)
+### 0. Preprocess Data (Optional)
+```bash
+# Prepare Q&A and distractor datasets from raw RACE CSV
+python scripts/preprocess_data.py --input data/raw/train.csv --output data/processed/
+
+# Or test with a smaller subset
+python scripts/preprocess_data.py --input data/raw/train.csv --output data/processed/ --sample 1000
+```
+
+This creates:
+- `data/processed/train_qa.csv` (Q&A pairs for Model A)
+- `data/processed/train_distractors.csv` (distractors for Model B)
+
+### 2. Run Streamlit App (UI only)
 ```bash
 cd ui
 streamlit run app.py
 ```
 This opens the interactive UI at `http://localhost:8501`
 
-### 2. Train Models (Kaggle Notebook)
+### 3. Train Models (Kaggle Notebook)
 Upload `notebooks/model_a_train.ipynb` to Kaggle Notebooks:
 - Load and preprocess RACE data
 - Train Logistic Regression, SVM, Random Forest, XGBoost
 - Implement K-Means, Label Propagation, GMM (unsupervised)
 - Ensemble voting and stacking
 - Export models to `models/model_a/traditional/`
+- Save `model_a_checkpoint.pkl` periodically in `models/model_a/traditional/` so training can resume
 
-Do the same for `notebooks/model_b_train.ipynb` for distractor and hint models.
+Do the same for `notebooks/model_b_train.ipynb` for distractor and hint models, and keep `model_b_checkpoint.pkl` for resume.
 
-### 3. Local Training (Optional)
+### 4. Local Training (Optional)
 ```bash
 python src/model_a_train.py --data data/raw/train.csv --output models/model_a/traditional/
 python src/model_b_train.py --data data/raw/train.csv --output models/model_b/traditional/
@@ -172,24 +186,21 @@ result = inference.verify_user_answer(passage, mcq['question'],
    - Download as `.zip`
    - Extract to `models/` directory locally
 
-## Models & Algorithms
+## Models Trained
 
-### Supervised Learning (Model A)
-- **Logistic Regression**: Fast baseline for answer verification
+Model A trains the following models:
+
+### Supervised
+- **Logistic Regression**: Fast baseline for Q&A verification
 - **Support Vector Machine (SVM)**: Non-linear classification for answer ranking
-- **Naive Bayes**: Question type classification
-- **Random Forest**: Feature importance for difficulty estimation
-- **XGBoost**: Gradient boosting for robust predictions
 
-### Unsupervised/Semi-Supervised (Model A)
-- **K-Means Clustering**: Group Q&A pairs by feature similarity (20 marks)
-- **Label Propagation**: Semi-supervised learning on partially labeled data
-- **Gaussian Mixture Models**: Soft clustering for question type patterns
+### Ensemble
+- **Soft Voting (LR + SVM)**: Combines LR and SVM predictions with 50/50 weighting
 
-### Ensemble Methods (Model A)
-- **Soft Voting**: Average probability outputs across classifiers
-- **Hard Voting**: Majority vote (A, B, C classifier outputs)
-- **Stacking**: Meta-classifier trained on base model predictions
+### Unsupervised
+- **K-Means Clustering**: Unsupervised grouping of Q&A pairs by similarity
+
+All models use text generation evaluation (BLEU, ROUGE, METEOR).
 
 ### Distractor Generation (Model B)
 - **One-Hot Encoding + Cosine Similarity**: Compare semantic overlap
@@ -217,24 +228,31 @@ result = inference.verify_user_answer(passage, mcq['question'],
 
 ## Evaluation Metrics
 
-### Model A
+### Model A and Model B
 | Metric | Description |
 |--------|-------------|
-| **Accuracy** | Proportion of correct predictions |
-| **Precision** | True positives / (true positives + false positives) |
-| **Recall** | True positives / (true positives + false negatives) |
-| **Macro F1** | Harmonic mean of precision & recall (macro-averaged) |
-| **Exact Match (EM)** | Same as accuracy for binary classification |
-| **Confusion Matrix** | 2×2 matrix of prediction outcomes |
+| **BLEU** | N-gram overlap between generated and reference text |
+| **ROUGE-1 / ROUGE-2 / ROUGE-L** | Overlap quality at unigram, bigram, and sequence level |
+| **METEOR** | Token, stem, and synonym-aware text similarity |
 
-### Model B
-| Metric | Description |
-|--------|-------------|
-| **Distractor Accuracy** | Correctness of distractor ranking |
-| **Distractor Precision/Recall** | Classification metrics for distractor binary classifier |
-| **Hint F1 Score** | Hint extraction quality |
-| **Human Evaluation** | 1-5 Likert scale (plausibility, diversity, clarity) |
-| **R² Score** | Regression quality for hint scoring model |
+For this project, final evaluation/reporting uses BLEU, ROUGE, and METEOR only.
+
+## Checkpointing During Kaggle Training
+
+To handle session disconnects and compute limits, both training scripts persist progress checkpoints:
+
+- `models/model_a/traditional/model_a_checkpoint.pkl`
+- `models/model_b/traditional/model_b_checkpoint.pkl`
+
+If training stops, rerun the same script and it resumes from the last completed stage.
+
+## GPU + Numba Acceleration
+
+Training code is CUDA-aware for Kaggle GPU sessions:
+
+- Model B distractor semantic scoring uses Numba CUDA kernels (with automatic CPU fallback).
+- Model A XGBoost uses GPU when CUDA is available (`device='cuda'`).
+- CUDA availability is checked at runtime using Numba.
 
 ## Technical Constraints
 

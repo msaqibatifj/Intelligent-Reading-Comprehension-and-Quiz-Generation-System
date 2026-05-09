@@ -10,11 +10,15 @@ Screens:
 """
 
 import streamlit as st
+import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add the project root to path.
+# Local: run from the repo root.
+# Kaggle: set the working directory to the uploaded project folder first.
+PROJECT_ROOT = Path(os.getcwd()).resolve()
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import components
 from components import (
@@ -54,24 +58,20 @@ apply_styles()
 def load_models():
     """Load unified inference models."""
     try:
-        base_dir = Path(__file__).parent.parent
-        # Define model paths
+        # Local: repo root. Kaggle: /kaggle/working/<project_folder>.
+        base_dir = PROJECT_ROOT
+        # Define model paths using the artifacts currently produced by training.
         model_a_paths = {
-            'lr': base_dir / 'models/model_a/traditional/lr_model.pkl',
-            'svm': base_dir / 'models/model_a/traditional/svm_model.pkl',
-            'nb': base_dir / 'models/model_a/traditional/nb_model.pkl',
-            'rf': base_dir / 'models/model_a/traditional/rf_model.pkl',
-            'xgb': base_dir / 'models/model_a/traditional/xgb_model.pkl',
-            'ensemble_voting': base_dir / 'models/model_a/traditional/ensemble_voting_model.pkl',
-            'ensemble_stacking': base_dir / 'models/model_a/traditional/ensemble_stacking_model.pkl',
-            'kmeans': base_dir / 'models/model_a/traditional/kmeans_model.pkl',
-            'label_propagation': base_dir / 'models/model_a/traditional/label_propagation_model.pkl',
-            'gmm': base_dir / 'models/model_a/traditional/gmm_model.pkl',
+            'lr': base_dir / 'models/model_a/traditional/logistic_regression.pkl',
+            'svm': base_dir / 'models/model_a/traditional/svm.pkl',
+            'kmeans': base_dir / 'models/model_a/traditional/kmeans.pkl',
+            'ensemble_voting': base_dir / 'models/model_a/traditional/metrics.pkl',
             'feature_engineer': base_dir / 'models/model_a/traditional/feature_engineer.pkl',
         }
         
         model_b_paths = {
-            'distractor_hint_generator': base_dir / 'models/model_b/traditional/distractor_hint_generator.pkl',
+            'distractor_ranker': base_dir / 'models/model_b/traditional/distractor_ranker.pkl',
+            'hint_scorer': base_dir / 'models/model_b/traditional/hint_scorer.pkl',
             'word2vec': base_dir / 'models/model_b/traditional/word2vec_model.pkl',
         }
         

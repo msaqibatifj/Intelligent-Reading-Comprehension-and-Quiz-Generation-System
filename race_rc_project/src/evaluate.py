@@ -1,124 +1,99 @@
-"""
-Evaluation metrics and reporting for Model A and Model B.
-"""
-import numpy as np
+"""Evaluation helpers for text generation tasks (BLEU, ROUGE, METEOR)."""
+
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score,
-    confusion_matrix, classification_report, roc_auc_score
-)
-from sklearn.metrics import r2_score, mean_squared_error
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
+import nltk
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+
+
+# Ensure required NLTK resources are available for METEOR tokenization/synonyms.
+for resource in ["punkt", "wordnet", "omw-1.4"]:
+    try:
+        nltk.data.find(f"tokenizers/{resource}" if resource == "punkt" else f"corpora/{resource}")
+    except LookupError:
+        nltk.download(resource, quiet=True)
+
+
+class GenerationMetricsEvaluator:
+    """Compute BLEU, ROUGE, and METEOR for generated text."""
+
+    def __init__(self):
+        self.rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+        self.smoothing = SmoothingFunction().method1
+
+    def _safe_tokens(self, text):
+        return str(text).strip().split()
+
+    def evaluate_generation(self, references, hypotheses):
+        """Return corpus-level BLEU/ROUGE/METEOR averages."""
+        if len(references) != len(hypotheses):
+            raise ValueError("references and hypotheses must have the same length")
+
+        if len(references) == 0:
+            return {
+                "bleu": 0.0,
+                "rouge_1": 0.0,
+                "rouge_2": 0.0,
+                "rouge_l": 0.0,
+                "meteor": 0.0,
+            }
+
+        bleu_scores = []
+        meteor_scores = []
+        rouge1_scores = []
+        rouge2_scores = []
+        rougeL_scores = []
+
+        for ref, hyp in zip(references, hypotheses):
+            ref_tokens = self._safe_tokens(ref)
+            hyp_tokens = self._safe_tokens(hyp)
+
+            bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=self.smoothing)
+            bleu_scores.append(float(bleu))
+
+            meteor = meteor_score([ref_tokens], hyp_tokens)
+            meteor_scores.append(float(meteor))
+
+            rouge = self.rouge.score(str(ref), str(hyp))
+            rouge1_scores.append(float(rouge["rouge1"].fmeasure))
+            rouge2_scores.append(float(rouge["rouge2"].fmeasure))
+            rougeL_scores.append(float(rouge["rougeL"].fmeasure))
+
+        n = float(len(references))
+        return {
+            "bleu": sum(bleu_scores) / n,
+            "rouge_1": sum(rouge1_scores) / n,
+            "rouge_2": sum(rouge2_scores) / n,
+            "rouge_l": sum(rougeL_scores) / n,
+            "meteor": sum(meteor_scores) / n,
+        }
 
 
 class ModelAEvaluator:
-    """Evaluation for Model A (Q&A verification)."""
-    
+    """Model A evaluator based on text-generation metrics only."""
+
     def __init__(self):
-        self.metrics = {}
-    
-    def evaluate(self, y_true, y_pred, y_pred_proba=None):
-        """
-        Compute evaluation metrics.
-        Returns: dict with all metrics
-        """
-        self.metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, average='macro'),
-            'recall': recall_score(y_true, y_pred, average='macro'),
-            'f1': f1_score(y_true, y_pred, average='macro'),
-            'confusion_matrix': confusion_matrix(y_true, y_pred).tolist(),
-        }
-        
-        if y_pred_proba is not None:
-            try:
-                self.metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba)
-            except:
-                self.metrics['roc_auc'] = None
-        
-        return self.metrics
-    
-    def exact_match(self, y_true, y_pred):
-        """Compute Exact Match score (same as accuracy for binary)."""
-        return accuracy_score(y_true, y_pred)
-    
-    def print_report(self, y_true, y_pred):
-        """Print detailed classification report."""
-        return classification_report(y_true, y_pred, 
-                                     target_names=['Incorrect', 'Correct'])
-    
-    def plot_confusion_matrix(self, y_true, y_pred, save_path=None):
-        """Plot confusion matrix."""
-        cm = confusion_matrix(y_true, y_pred)
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-        plt.title('Model A - Answer Verification Confusion Matrix')
-        plt.ylabel('True')
-        plt.xlabel('Predicted')
-        if save_path:
-            plt.savefig(save_path, dpi=100, bbox_inches='tight')
-        plt.close()
+        self.generator_metrics = GenerationMetricsEvaluator()
+
+    def evaluate(self, references, hypotheses):
+        return self.generator_metrics.evaluate_generation(references, hypotheses)
 
 
 class ModelBEvaluator:
-    """Evaluation for Model B (Distractor & Hint generation)."""
-    
+    """Model B evaluator based on text-generation metrics only."""
+
     def __init__(self):
-        self.metrics = {}
-    
-    def evaluate_distractor_ranking(self, y_true, y_pred, y_pred_proba=None):
-        """
-        Evaluate distractor ranking model (binary: correct vs. distractor).
-        """
-        self.metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, average='macro'),
-            'recall': recall_score(y_true, y_pred, average='macro'),
-            'f1': f1_score(y_true, y_pred, average='macro'),
-            'confusion_matrix': confusion_matrix(y_true, y_pred).tolist(),
-        }
-        
-        if y_pred_proba is not None:
-            try:
-                self.metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba)
-            except:
-                self.metrics['roc_auc'] = None
-        
-        return self.metrics
-    
-    def evaluate_hint_extraction(self, hint_scores, y_true):
-        """
-        Evaluate hint extraction (assuming y_true is binary: relevant=1, irrelevant=0).
-        """
-        y_pred = (hint_scores > np.median(hint_scores)).astype(int)
-        
-        metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, average='macro'),
-            'recall': recall_score(y_true, y_pred, average='macro'),
-            'f1': f1_score(y_true, y_pred, average='macro'),
-        }
-        
-        return metrics
-    
-    def evaluate_hint_scoring_regression(self, y_true, y_pred):
-        """
-        Evaluate hint scoring regression model.
-        """
-        metrics = {
-            'r2_score': r2_score(y_true, y_pred),
-            'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
-            'mae': np.mean(np.abs(y_true - y_pred))
-        }
-        
-        return metrics
-    
+        self.generator_metrics = GenerationMetricsEvaluator()
+
+    def evaluate_distractors(self, references, hypotheses):
+        return self.generator_metrics.evaluate_generation(references, hypotheses)
+
+    def evaluate_hints(self, references, hypotheses):
+        return self.generator_metrics.evaluate_generation(references, hypotheses)
+
     def human_evaluation_form(self, question_id, question, distractors, hints):
-        """
-        Generate a human evaluation form template (1-5 Likert scale).
-        """
+        """Generate a human evaluation form template (1-5 Likert scale)."""
         form = {
             'question_id': question_id,
             'question': question,
@@ -135,24 +110,21 @@ class ModelBEvaluator:
 
 
 class UnifiedEvaluator:
-    """Unified evaluation reporting."""
-    
+    """Unified BLEU/ROUGE/METEOR reporting for both models."""
+
     def __init__(self):
         self.model_a_evaluator = ModelAEvaluator()
         self.model_b_evaluator = ModelBEvaluator()
-    
-    def generate_inference_report(self, inferences, y_true_a, y_true_b):
-        """
-        Generate comprehensive inference report.
-        inferences: list of dicts with model predictions
-        """
+
+    def generate_inference_report(self, model_a_refs, model_a_hyps, model_b_refs, model_b_hyps):
+        """Generate combined text-generation metric report."""
         report = {
-            'model_a': self.model_a_evaluator.evaluate(y_true_a, inferences['model_a']),
-            'model_b': self.model_b_evaluator.evaluate_distractor_ranking(y_true_b, inferences['model_b'])
+            'model_a': self.model_a_evaluator.evaluate(model_a_refs, model_a_hyps),
+            'model_b': self.model_b_evaluator.evaluate_distractors(model_b_refs, model_b_hyps)
         }
-        
+
         return report
-    
+
     def export_session_results(self, results_df, output_path):
         """Export session results to CSV."""
         results_df.to_csv(output_path, index=False)
