@@ -17,10 +17,12 @@ import random
 import joblib
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from preprocessing import clean_text, tokenize, split_into_sentences, PROCESSED_DIR, BASE_DIR
-from model_a_train import generate_questions_from_passage, verify_answer as verify_answer_ma
+from src.preprocessing import clean_text, tokenize, split_into_sentences, PROCESSED_DIR, BASE_DIR
+from src.model_a_train import generate_questions_from_passage, verify_answer as verify_answer_ma
 
 try:
     from model_b_train import generate_distractors, generate_hints
@@ -248,7 +250,7 @@ def verify_answer(article, question, chosen_option_text, correct_answer_text):
 
     if models.get('tfidf'):
         try:
-            from preprocessing import tfidf_cosine
+            from src.preprocessing import tfidf_cosine
             cos_chosen = tfidf_cosine(article, chosen_option_text, models['tfidf'])
             cos_correct = tfidf_cosine(article, correct_answer_text, models['tfidf'])
             conf = cos_chosen / (cos_chosen + cos_correct + 1e-9)

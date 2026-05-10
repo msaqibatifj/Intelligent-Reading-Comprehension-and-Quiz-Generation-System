@@ -8,16 +8,18 @@ import os, sys, random, time
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib
+import matplotlib  # type: ignore[reportMissingModuleSource]
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.pyplot as plt  # type: ignore[reportMissingModuleSource]
+import seaborn as sns  # type: ignore[reportMissingModuleSource]
 import joblib
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
-sys.path.insert(0, SRC_DIR)
-from preprocessing import DATA_ROOT
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.preprocessing import DATA_ROOT
 
 # ── Page configuration ────────────────────────────────────────────────────────
 st.set_page_config(
@@ -354,74 +356,6 @@ footer { visibility: hidden; }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUILT-IN SAMPLE PASSAGES
-# ─────────────────────────────────────────────────────────────────────────────
-
-SAMPLE_PASSAGES = [
-    {
-        "title": "Amazon Rainforest",
-        "emoji": "🌿",
-        "text": (
-            "The Amazon rainforest is often referred to as the lungs of the Earth. "
-            "It produces approximately 20 percent of the world's oxygen and is home to "
-            "more than 10 million species of plants, animals, and insects. The rainforest "
-            "spans 5.5 million square kilometres across nine South American countries, with "
-            "Brazil containing the largest share. Scientists estimate that the Amazon stores "
-            "about 150–200 billion tonnes of carbon. Deforestation, driven by agriculture, "
-            "logging, and mining, destroys an estimated 17,000 square kilometres each year. "
-            "Indigenous communities have lived in harmony with the forest for thousands of "
-            "years, developing sustainable practices that protect biodiversity."
-        ),
-    },
-    {
-        "title": "Artificial Intelligence in Education",
-        "emoji": "🤖",
-        "text": (
-            "Artificial intelligence is transforming education by providing personalised "
-            "learning experiences for students. Machine learning algorithms can analyse a "
-            "student's performance in real-time and adapt the curriculum to address "
-            "individual weaknesses. AI-powered tutoring systems have demonstrated measurable "
-            "improvements in student outcomes across many schools worldwide. "
-            "Natural language processing enables automated essay grading, freeing teachers "
-            "to focus on higher-order instruction. Governments, researchers, and companies "
-            "must work together to address concerns about data privacy and algorithmic bias "
-            "before widespread deployment. Experts recommend a hybrid approach where AI "
-            "augments, rather than replaces, the role of human educators in classrooms."
-        ),
-    },
-    {
-        "title": "The Solar System",
-        "emoji": "🪐",
-        "text": (
-            "Our solar system consists of the Sun and everything gravitationally bound to it, "
-            "including eight planets, five recognised dwarf planets, and countless smaller bodies. "
-            "The Sun accounts for 99.86 percent of the total mass of the solar system. "
-            "The four inner rocky planets are Mercury, Venus, Earth, and Mars. "
-            "Beyond the asteroid belt lie the gas giants Jupiter and Saturn, "
-            "followed by the ice giants Uranus and Neptune. Jupiter is the largest planet, "
-            "with a mass greater than all other planets combined. "
-            "Scientists continue to study the outer regions of the solar system, "
-            "and some researchers hypothesise the existence of a ninth planet far beyond Neptune."
-        ),
-    },
-    {
-        "title": "Climate Change",
-        "emoji": "🌍",
-        "text": (
-            "Climate change refers to long-term shifts in global temperatures and weather patterns. "
-            "While natural processes have always influenced climate, since the 19th century "
-            "human activities have been the main driver of climate change, primarily due to "
-            "burning fossil fuels. This releases greenhouse gases such as carbon dioxide and "
-            "methane that trap heat in the atmosphere. Rising temperatures cause more frequent "
-            "extreme weather events, rising sea levels, and loss of biodiversity. "
-            "International agreements like the Paris Accord aim to limit warming to 1.5 degrees Celsius. "
-            "Renewable energy, reforestation, and changes in agriculture are among the key solutions."
-        ),
-    },
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -452,7 +386,7 @@ init_state()
 @st.cache_resource(show_spinner=False)
 def load_inference_module():
     try:
-        from inference import run_inference, verify_answer, get_model_metrics, load_models
+        from src.inference import run_inference, verify_answer, get_model_metrics, load_models
         load_models()
         return run_inference, verify_answer, get_model_metrics, True
     except Exception:

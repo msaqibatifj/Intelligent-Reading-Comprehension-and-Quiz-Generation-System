@@ -24,10 +24,10 @@ import pickle
 
 import numpy as np
 import pandas as pd
-import matplotlib
+import matplotlib  # type: ignore[reportMissingModuleSource]
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.pyplot as plt  # type: ignore[reportMissingModuleSource]
+import seaborn as sns  # type: ignore[reportMissingModuleSource]
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, confusion_matrix, classification_report,
@@ -35,10 +35,12 @@ from sklearn.metrics import (
 from scipy.sparse import load_npz
 import joblib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from preprocessing import PROCESSED_DIR, BASE_DIR
-from model_a_train import (
+from src.preprocessing import PROCESSED_DIR, BASE_DIR
+from src.model_a_train import (
     compute_4way_accuracy,
     cosine_similarity_accuracy,
     compute_train_test_domain_similarity,
@@ -329,7 +331,7 @@ def evaluate_cosine_similarity(tfidf_vec, test_df, train_df=None, sample_n=500):
 
 
 def _save_cosine_sim_plot(tfidf_vec, eval_df):
-    from preprocessing import tfidf_cosine
+    from src.preprocessing import tfidf_cosine
 
     correct_sims, wrong_sims = [], []
     for _, row in eval_df.iterrows():
