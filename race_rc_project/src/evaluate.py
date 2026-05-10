@@ -134,13 +134,14 @@ def compute_generation_metrics(test_df, tfidf_vec=None, sample_n=300):
         article = str(row.get('article', ''))
         if len(article) < 50:
             continue
-        all_generated.extend(generate_questions_from_passage(article, n_questions=2))
+        all_generated.extend(generate_questions_from_passage(article, count=2))
 
     if not all_generated:
         print("  WARNING: no generated samples.")
         return {}
 
-    results = ma_compute_generation_metrics(all_generated, sample_df, sample_n=sample_n)
+    # model_a_train.generation_metrics expects the keyword `n_sample`
+    results = ma_compute_generation_metrics(all_generated, sample_df, n_sample=sample_n)
     if not results:
         return {}
 
@@ -200,8 +201,10 @@ def compute_question_generation_metrics(test_df, sample_n=300, n_candidates=5):
         article = str(row['article'])
         gold_q  = str(row['question'])
 
+        # `generate_questions_from_passage` (alias of `compose_questions`) expects
+        # the `count` keyword for number of questions.
         candidates_rows = generate_questions_from_passage(
-            article, n_questions=n_candidates
+            article, count=n_candidates
         )
         candidates = [d['question'] for d in candidates_rows]
         if not candidates:
@@ -314,8 +317,9 @@ def evaluate_cosine_similarity(tfidf_vec, test_df, train_df=None, sample_n=500):
     print(f"  {'Similarity gap (correct − wrong)':<35}: {cos['sim_gap']:.4f}  [{gap_flag}]")
 
     if train_df is not None:
+        # model_a_train.domain_overlap expects `n_sample` keyword
         domain_sim = compute_train_test_domain_similarity(
-            train_df, test_df, tfidf_vec, sample_n=200
+            train_df, test_df, tfidf_vec, n_sample=200
         )
         print(f"\n  Train↔Test domain similarity: {domain_sim:.4f}")
         cos['domain_similarity'] = domain_sim

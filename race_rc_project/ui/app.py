@@ -330,9 +330,10 @@ section[data-testid="stSidebar"] .stRadio label {
     padding: 1rem 1.2rem;
     font-size: 0.88rem;
     line-height: 1.62;
-    max-height: 220px;
+    max-height: 500px;
     overflow-y: auto;
     border: 1px solid #1d4ed8;
+    white-space: pre-wrap;
 }
 
 .dataset-badge {
@@ -671,19 +672,6 @@ if nav == "📝  Article Input":
     st.markdown('<div class="sec-header">📝 Provide a Reading Passage</div>',
                 unsafe_allow_html=True)
 
-    # ── Top row: sample pills ────────────────────────────────────────────────
-    st.markdown("**Quick-load built-in samples:**")
-    pill_cols = st.columns(len(SAMPLE_PASSAGES))
-    for col, sp in zip(pill_cols, SAMPLE_PASSAGES):
-        with col:
-            if st.button(f"{sp['emoji']} {sp['title']}", use_container_width=True,
-                         key=f"pill_{sp['title']}"):
-                st.session_state['article'] = sp['text']
-                reset_quiz()
-                st.rerun()
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
     # ── Main two-column layout ───────────────────────────────────────────────
     col_left, col_right = st.columns([3, 2], gap="large")
 
@@ -694,7 +682,7 @@ if nav == "📝  Article Input":
             value=st.session_state.get('article', ''),
             height=280,
             placeholder="Enter an English reading passage here…\n\n"
-                         "Tip: use the sample buttons above or click 'Random from Dataset'.",
+                         "Tip: click 'Random from Dataset' to load a sample.",
             key='article_ta',
         )
         char_count = len(article_input)
@@ -817,7 +805,7 @@ if nav == "📝  Article Input":
         if article_now:
             st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
             st.markdown("#### 👁️ Passage Preview")
-            preview = article_now[:600] + ('…' if len(article_now) > 600 else '')
+            preview = article_now[:2000] + ('…' if len(article_now) > 2000 else '')
             st.markdown(f'<div class="article-preview">{preview}</div>',
                         unsafe_allow_html=True)
             if st.session_state.get('from_dataset'):
@@ -966,7 +954,7 @@ elif nav == "🧠  Quiz":
                 if art_text:
                     st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
                     st.markdown("**📄 Passage Reference**")
-                    preview = art_text[:500] + ('…' if len(art_text) > 500 else '')
+                    preview = art_text[:2000] + ('…' if len(art_text) > 2000 else '')
                     st.markdown(f'<div class="article-preview">{preview}</div>',
                                 unsafe_allow_html=True)
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -1091,7 +1079,7 @@ elif nav == "💡  Hints":
                 st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
                 st.markdown("**📄 Passage Reference**")
                 st.markdown(
-                    f'<div class="article-preview">{art_text[:600]}…</div>',
+                    f'<div class="article-preview">{art_text[:2000]}</div>',
                     unsafe_allow_html=True,
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
