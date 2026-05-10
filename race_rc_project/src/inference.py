@@ -1,399 +1,318 @@
 """
-Unified inference API for Model A (Q&A verification) and Model B (Distractor & Hint generation).
-"""
-import numpy as np
-import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
-from nltk.tokenize import sent_tokenize
-import joblib
-from pathlib import Path
-import nltk
-from scipy.sparse import csr_matrix, hstack
+inference.py
+Unified inference API — used by the Streamlit UI and the Colab notebook.
 
-from .preprocessing import FeatureEngineer
+Public functions:
+  run_inference(article, race_rows=None) → {'questions': [...], 'latency_ms': N}
+  verify_answer(article, question, chosen_text, correct_text) → dict
+  get_model_metrics() → dict
+"""
+
+import os
+import sys
+import pickle
+import time
+import random
+
+import joblib
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from preprocessing import clean_text, tokenize, split_into_sentences, PROCESSED_DIR, BASE_DIR
+from model_a_train import generate_questions_from_passage, verify_answer as verify_answer_ma
 
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    from model_b_train import generate_distractors, generate_hints
+except Exception:
+    def generate_distractors(article, answer, model, n=3):
+        return []
+
+    def generate_hints(article, question, model, n=3):
+        sents = split_into_sentences(article)
+        if not sents:
+            return ["Read carefully", "Focus keywords", "Check passage"]
+        return [f"Hint {i+1}: {s[:100]} …" for i, s in enumerate(sents[:n])]
+
+MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'traditional')
+MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'traditional')
 
 
-class ModelAInference:
-    """Inference for Question & Answer Generator/Verifier."""
-    
-    def __init__(self, model_paths):
-        """
-        model_paths: dict with keys like 'lr', 'svm', 'rf', 'ensemble'
-        """
-        self.models = {}
-        self.feature_engineer = None
-        self.load_errors = []
-        self.load_models(model_paths)
-    
-    def load_models(self, model_paths):
-        """Load trained models from disk."""
-        for model_name, path in model_paths.items():
-            try:
-                # Special handling for feature_engineer
-                if model_name == 'feature_engineer':
-                    self.feature_engineer = FeatureEngineer.load(path)
-                    self.models[model_name] = self.feature_engineer
-                    print(f"[OK] Loaded {model_name} from {path}")
-                else:
-                    loaded = joblib.load(path)
-                    self.models[model_name] = loaded
-                    
-                    # Also store with short name (e.g., 'lr_model' -> 'lr')
-                    if model_name.endswith('_model'):
-                        short_name = model_name.replace('_model', '')
-                        self.models[short_name] = loaded
-                    
-                    print(f"[OK] Loaded {model_name} from {path}")
-            except FileNotFoundError as exc:
-                self.load_errors.append({
-                    'model': model_name,
-                    'path': str(path),
-                    'error': 'FileNotFoundError',
-                    'detail': str(exc)
-                })
-                print(f"[WARN] Model {model_name} not found at {path}")
-            except Exception as exc:
-                self.load_errors.append({
-                    'model': model_name,
-                    'path': str(path),
-                    'error': type(exc).__name__,
-                    'detail': str(exc)
-                })
-                print(f"[WARN] Failed to load {model_name} from {path}: {exc}")
-    
-    def predict_answer(self, passage, question, options, method='ensemble_voting_model'):
-        """
-        Predict which option (0,1,2,3) is correct.
-        
-        Args:
-            passage: article text
-            question: question text
-            options: list of [option_A, option_B, option_C, option_D]
-            method: model to use ('ensemble_voting_model', 'lr_model', 'rf_model', etc.)
-        
-        Returns:
-            {
-                'predicted_option': 0-3,
-                'confidence': 0.0-1.0,
-                'probabilities': [prob_0, prob_1, prob_2, prob_3],
-                'explanation': str
-            }
-        """
-        if method not in self.models:
-            return {
-                'predicted_option': None,
-                'confidence': 0.0,
-                'probabilities': [0, 0, 0, 0],
-                'explanation': f"Model {method} not loaded."
-            }
-        
-        model = self.models[method]
-        
+_cache = {}
+
+
+def load_models():
+    """Load all trained models from disk on first call; return cache thereafter."""
+    if _cache:
+        return _cache
+
+    def safe_load(path, label):
+        if os.path.exists(path):
+            return joblib.load(path)
+        print(f"  WARNING: {label} not found at {path}.")
+        return None
+
+    _cache['lr']  = safe_load(os.path.join(MODEL_A_DIR, 'logistic_regression.pkl'), 'LR')
+    _cache['svm'] = safe_load(os.path.join(MODEL_A_DIR, 'svm.pkl'),                 'SVM')
+    _cache['meta'] = safe_load(os.path.join(MODEL_A_DIR, 'stacking_meta.pkl'),      'StackMeta')
+    _cache['dist_ranker'] = safe_load(os.path.join(MODEL_B_DIR, 'distractor.pkl'),  'Distractor')
+    _cache['hint_scorer'] = safe_load(os.path.join(MODEL_B_DIR, 'hint.pkl'),       'Hint')
+
+    def _try_pickle(path, label):
         try:
-            # Ensure we have 4 options
-            if len(options) != 4:
-                return {
-                    'predicted_option': None,
-                    'confidence': 0.0,
-                    'probabilities': [0, 0, 0, 0],
-                    'explanation': f"Expected 4 options, got {len(options)}"
-                }
-            
-            # Extract features for all 4 options
-            if self.feature_engineer is not None:
-                # One-Hot features for each option
-                onehot_parts = []
-                for option in options:
-                    combined = question + ' ' + option
-                    onehot_feat = self.feature_engineer.transform_onehot([combined])
-                    onehot_parts.append(onehot_feat)
-                
-                # Stack one-hot features from all options
-                onehot_all = hstack(onehot_parts)
-                
-                # Lexical features for all options
-                lexical_all = self.feature_engineer.extract_lexical_features(
-                    question, options, passage
-                )
-                lexical_all_sparse = csr_matrix(lexical_all.flatten()).reshape(1, -1)
-                
-                # Combine all features
-                X = hstack([onehot_all, lexical_all_sparse])
-                X_dense = X.toarray()
-                
-                # Get prediction
-                predicted_option = model.predict(X_dense)[0]
-                pred_proba = model.predict_proba(X_dense)[0]
-                confidence = float(pred_proba[predicted_option])
-                
-            else:
-                # Fallback: random prediction
-                predicted_option = np.random.randint(0, 4)
-                confidence = 0.25
-                pred_proba = [0.25, 0.25, 0.25, 0.25]
-            
-            option_labels = ['A', 'B', 'C', 'D']
-            
-            return {
-                'predicted_option': int(predicted_option),
-                'predicted_letter': option_labels[predicted_option],
-                'confidence': float(confidence),
-                'probabilities': [float(p) for p in pred_proba],
-                'explanation': f"Predicted {option_labels[predicted_option]} (option {predicted_option}) with {confidence:.1%} confidence"
-            }
+            with open(path, 'rb') as f:
+                return pickle.load(f)
         except Exception as e:
-            return {
-                'predicted_option': None,
-                'confidence': 0.0,
-                'probabilities': [0, 0, 0, 0],
-                'explanation': f"Error: {str(e)}"
-            }
-    
-    def verify_answer(self, passage, question, option, method='ensemble_voting_model'):
-        """
-        [LEGACY] Verify if an option is correct given passage and question.
-        Use predict_answer() instead for multi-class classification.
-        
-        Returns: (is_correct: bool, confidence: float, explanation: str)
-        """
-        # This method is kept for backward compatibility but returns dummy results
-        # Recommend using predict_answer() with all 4 options instead
-        return False, 0.0, "LEGACY METHOD - Use predict_answer() instead"
-    
-    def generate_question(self, passage, method='template'):
-        """
-        Generate a question from passage.
-        Returns: (question: str, answer: str)
-        """
-        sentences = sent_tokenize(passage)
-        if not sentences:
-            return "", ""
-        
-        # Mock: return first sentence as question, dummy answer
-        question = f"What is the main idea of: {sentences[0][:50]}...?"
-        answer = sentences[0]
-        
-        return question, answer
+            print(f"  WARNING: could not load {label} ({path}): {e}")
+            return None
 
-
-class ModelBInference:
-    """Inference for Distractor & Hint Generator."""
-    
-    def __init__(self, model_paths):
-        """
-        model_paths: dict with keys like 'distractor_ranker', 'hint_scorer'
-        """
-        self.models = {}
-        self.feature_engineer = None
-        self.load_errors = []
-        self.load_models(model_paths)
-    
-    def load_models(self, model_paths):
-        """Load trained models from disk."""
-        for model_name, path in model_paths.items():
-            try:
-                self.models[model_name] = joblib.load(path)
-                print(f"[OK] Loaded {model_name} from {path}")
-            except FileNotFoundError as exc:
-                self.load_errors.append({
-                    'model': model_name,
-                    'path': str(path),
-                    'error': 'FileNotFoundError',
-                    'detail': str(exc)
-                })
-                print(f"[WARN] Model {model_name} not found at {path}")
-            except Exception as exc:
-                self.load_errors.append({
-                    'model': model_name,
-                    'path': str(path),
-                    'error': type(exc).__name__,
-                    'detail': str(exc)
-                })
-                print(f"[WARN] Failed to load {model_name} from {path}: {exc}")
-    
-    def generate_distractors(self, passage, question, correct_answer, num_distractors=3):
-        """
-        Generate plausible but incorrect distractors.
-        Returns: list of strings (distractors)
-        """
-        # Extract candidate phrases from passage
-        candidates = self._extract_candidates(passage, correct_answer)
-        
-        if len(candidates) < num_distractors:
-            # Fallback: pad with similar-length gibberish
-            candidates.extend([f"Option {i}" for i in range(num_distractors)])
-        
-        # Rank candidates using distractor ranker
-        if 'distractor_ranker' in self.models:
-            scores = self._score_distractors(candidates, question, correct_answer)
-            sorted_idx = np.argsort(scores)[::-1]  # Sort descending
-            distractors = [candidates[i] for i in sorted_idx[:num_distractors]]
+    for pkl_key, fname in [('ohe', 'ohe_vectorizer.pkl'), ('tfidf', 'tfidf_vectorizer.pkl')]:
+        path = os.path.join(PROCESSED_DIR, fname)
+        if os.path.exists(path):
+            _cache[pkl_key] = _try_pickle(path, fname)
         else:
-            distractors = candidates[:num_distractors]
-        
-        return distractors
-    
-    def _extract_candidates(self, passage, correct_answer, top_k=20):
-        """Extract candidate phrases from passage (excluding correct answer)."""
-        words = passage.split()
-        candidates = []
-        for i in range(len(words) - 2):
-            phrase = ' '.join(words[i:i+3])
-            if phrase != correct_answer and len(phrase) > 3:
-                candidates.append(phrase)
-        return candidates[:top_k]
-    
-    def _score_distractors(self, candidates, question, correct_answer):
-        """Score distractors using trained model."""
-        scores = np.random.rand(len(candidates))  # Mock scoring
-        return scores
-    
-    def generate_hints(self, passage, question, correct_answer, num_hints=3):
-        """
-        Generate graduated hints (vague → specific) without revealing answer.
-        Returns: list of strings (hints in order of specificity)
-        """
-        sentences = sent_tokenize(passage)
-        
-        if not sentences:
-            return ["No hints available."]
-        
-        # Compute cosine similarity between sentences and question
-        hint_scores = []
-        for sent in sentences:
-            # Mock: simple word overlap as proxy
-            score = len(set(question.lower().split()) & set(sent.lower().split()))
-            hint_scores.append((sent, score))
-        
-        # Sort by score and return top hints
-        hint_scores.sort(key=lambda x: x[1], reverse=True)
-        hints = [sent for sent, _ in hint_scores[:num_hints]]
-        
-        # Ensure hints don't directly contain the answer
-        hints = [hint for hint in hints if correct_answer.lower() not in hint.lower()][:num_hints]
-        
-        if len(hints) < num_hints:
-            hints.extend([f"Hint {i+1}" for i in range(num_hints - len(hints))])
-        
-        return hints[:num_hints]
+            alt = os.path.join(PROCESSED_DIR, 'tfidf.pkl') if pkl_key == 'tfidf' else None
+            if alt and os.path.exists(alt):
+                _cache[pkl_key] = _try_pickle(alt, 'tfidf.pkl')
+            else:
+                print(f"  WARNING: {fname} not found. Run preprocessing / training first.")
+                _cache[pkl_key] = None
+
+    return _cache
 
 
-class UnifiedInference:
-    """Unified inference for both Model A and Model B."""
-    
-    def __init__(self, model_a_paths, model_b_paths):
-        self.model_a_paths = model_a_paths
-        self.model_b_paths = model_b_paths
-        self.model_a = ModelAInference(model_a_paths)
-        self.model_b = ModelBInference(model_b_paths)
-        self.load_errors = {
-            'model_a': self.model_a.load_errors,
-            'model_b': self.model_b.load_errors
-        }
-    
-    def verify_qa(self, question, answer, article):
-        """Verify if a Q&A pair is valid using Model A ensemble."""
-        try:
-            # Load ensemble model for Q&A verification
-            ensemble_path = self.model_a_paths.get('ensemble_voting')
-            if ensemble_path:
-                model = joblib.load(ensemble_path)
-                # Mock voting ensemble: return basic structure
-                return {
-                    'ensemble_prediction': 0.7,
-                    'votes_for_valid': 7,
-                    'total_models': 10,
-                    'is_valid_qa': True,
-                    'model_predictions': {
-                        'lr_model': {'pred': 1, 'confidence': 0.8},
-                        'svm_model': {'pred': 1, 'confidence': 0.75},
-                        'rf_model': {'pred': 0, 'confidence': 0.6},
-                        'xgb_model': {'pred': 1, 'confidence': 0.85},
-                        'ensemble_voting': {'pred': 1, 'confidence': 0.7},
-                        'ensemble_stacking': {'pred': 1, 'confidence': 0.72},
-                        'kmeans_model': {'pred': 2, 'confidence': 0.5},
-                        'label_propagation': {'pred': 1, 'confidence': 0.68},
-                        'gmm_model': {'pred': 1, 'confidence': 0.62},
-                    }
-                }
-            return {'error': 'Ensemble model not found'}
-        except Exception as e:
-            return {'error': str(e)}
-    
-    def generate_quiz_options(self, correct_answer, wrong_options, question, article):
-        """Rank distractors using Model B."""
-        try:
-            # Return ranked distractors with scores
-            ranked = []
-            for i, option in enumerate(wrong_options, 1):
-                ranked.append({
-                    'text': option,
-                    'score': 1.0 - (i * 0.15),  # Simple mock scoring
-                    'rank': i
-                })
-            return {'distractors': ranked}
-        except Exception as e:
-            return {'error': str(e)}
-    
-    def generate_hints(self, correct_answer, article, num_hints=3):
-        """Extract hints from article using Model B."""
-        try:
-            # Simple mock hint extraction
-            sentences = sent_tokenize(article)
-            hints = []
-            for i, sentence in enumerate(sentences[:num_hints]):
-                hints.append({
-                    'text': sentence.strip(),
-                    'score': 0.85 - (i * 0.05),
-                    'source': 'article'
-                })
-            return {'hints': hints}
-        except Exception as e:
-            return {'error': str(e)}
-    
-    def generate_and_verify_mcq(self, passage):
-        """
-        End-to-end: generate question, answer, distractors, hints.
-        Returns: dict with question, correct_answer, distractors, hints
-        """
-        # Generate question
-        question, answer = self.model_a.generate_question(passage)
-        
-        # Generate distractors
-        distractors = self.model_b.generate_distractors(passage, question, answer)
-        
-        # Generate hints
-        hints = self.model_b.generate_hints(passage, question, answer, num_hints=3)
-        
-        return {
-            'question': question,
-            'correct_answer': answer,
-            'distractors': distractors,
-            'options': [answer] + distractors,  # Shuffle this in UI
-            'hints': hints
-        }
-    
-    def verify_user_answer(self, passage, question, correct_answer, user_option):
-        """
-        Verify user's selected option.
-        Returns: dict with is_correct, confidence, explanation
-        """
-        is_correct, confidence, explanation = self.model_a.verify_answer(
-            passage, question, user_option
+def remove_answer_from_question(question_text, answer_text):
+    """Utility: replace answer tokens in question with '___'."""
+    import re
+    for token in tokenize(answer_text):
+        if len(token) > 3:
+            pattern = r'\b' + re.escape(token) + r'\b'
+            question_text = re.sub(pattern, '___', question_text, flags=re.IGNORECASE)
+    return question_text
+
+
+def shuffle_options(correct_answer, distractors):
+    """Randomly assign correct answer + 3 distractors to slots A/B/C/D."""
+    pool = [correct_answer] + distractors[:3]
+    random.shuffle(pool)
+    idx  = pool.index(correct_answer)
+    lbls = ['A', 'B', 'C', 'D']
+    return {lbls[i]: pool[i] for i in range(4)}, lbls[idx]
+
+
+def _get_hints(article, question, models):
+    if models.get('hint_scorer'):
+        return generate_hints(article, question, models['hint_scorer'], n=3)
+    sents = split_into_sentences(article)
+    return [f"Hint {i+1}: {s[:100]} …" for i, s in enumerate(sents[:3])]
+
+
+def _build_fallback_distractors(article, correct_answer, n=3):
+    ans_set = set(tokenize(correct_answer))
+    pool = list(dict.fromkeys([
+        t for t in tokenize(article) if t not in ans_set and len(t) > 3
+    ]))
+    while len(pool) < n:
+        pool.append(f"option {len(pool) + 1}")
+    return pool[:n]
+
+
+def _model_a_pack(models):
+    return {
+        'lr':   models.get('lr'),
+        'svm':  models.get('svm'),
+        'meta': models.get('meta'),
+    }
+
+
+def build_question_from_race_row(article, row, models):
+    correct_letter = str(row.get('answer', 'A')).strip().upper()
+    correct_answer = str(row.get(correct_letter, ''))
+    hints = _get_hints(article, str(row.get('question', '')), models)
+
+    return {
+        'question':        str(row.get('question', '')),
+        'correct_answer':  correct_answer,
+        'correct_label':   correct_letter,
+        'options': {
+            'A': str(row.get('A', '')),
+            'B': str(row.get('B', '')),
+            'C': str(row.get('C', '')),
+            'D': str(row.get('D', '')),
+        },
+        'hints':           hints,
+        'source_sentence': article[:200],
+    }
+
+
+def build_question_from_generated(article, item, models):
+    """Map model_a_train.generate_questions_from_passage() dict to UI shape."""
+    q_text = item['question']
+    opts = item.get('options') or {}
+    correct_letter = str(item.get('correct_letter', 'A')).strip().upper()
+    correct_answer = item.get('answer', opts.get(correct_letter, ''))
+
+    if models.get('dist_ranker') and correct_answer:
+        distractors = generate_distractors(
+            article, correct_answer, models['dist_ranker'], n=3
         )
-        
-        return {
-            'is_correct': is_correct,
-            'confidence': confidence,
-            'explanation': explanation,
-            'correct_answer': correct_answer
+        opts2, correct_letter = shuffle_options(correct_answer, distractors)
+        opts = opts2
+
+    hints = _get_hints(article, q_text, models)
+    return {
+        'question':        q_text,
+        'correct_answer':  correct_answer,
+        'correct_label':   correct_letter,
+        'options':         opts,
+        'hints':           hints,
+        'source_sentence': str(item.get('source_sentence', '')),
+    }
+
+
+def run_inference(article, race_rows=None):
+    t0 = time.time()
+    models = load_models()
+
+    question_list = []
+
+    if race_rows:
+        for row in race_rows[:5]:
+            question_list.append(build_question_from_race_row(article, row, models))
+
+    n_needed = 5 - len(question_list)
+    if n_needed > 0:
+        raw = generate_questions_from_passage(article, n_questions=n_needed + 2)
+        for item in raw[:n_needed]:
+            question_list.append(build_question_from_generated(article, item, models))
+
+    latency_ms = int((time.time() - t0) * 1000)
+    print(f"  run_inference: {len(question_list)} questions in {latency_ms} ms")
+
+    return {'questions': question_list, 'latency_ms': latency_ms}
+
+
+def verify_answer(article, question, chosen_option_text, correct_answer_text):
+    models = load_models()
+    is_correct = clean_text(chosen_option_text) == clean_text(correct_answer_text)
+
+    pack = _model_a_pack(models)
+    if pack['lr'] and pack['svm'] and models.get('ohe'):
+        try:
+            out = verify_answer_ma(
+                article, question, chosen_option_text, pack, models['ohe']
+            )
+            conf = float(out['probability'])
+            return {
+                'is_correct': is_correct,
+                'confidence': conf if is_correct else (1.0 - conf),
+                'method': 'stacking ensemble + direct match',
+            }
+        except Exception:
+            pass
+
+    if models.get('tfidf'):
+        try:
+            from preprocessing import tfidf_cosine
+            cos_chosen = tfidf_cosine(article, chosen_option_text, models['tfidf'])
+            cos_correct = tfidf_cosine(article, correct_answer_text, models['tfidf'])
+            conf = cos_chosen / (cos_chosen + cos_correct + 1e-9)
+            return {
+                'is_correct': is_correct,
+                'confidence': conf if is_correct else (1.0 - conf),
+                'method': 'tfidf cosine similarity',
+            }
+        except Exception:
+            pass
+
+    return {
+        'is_correct': is_correct,
+        'confidence': 1.0 if is_correct else 0.0,
+        'method': 'direct match',
+    }
+
+
+def get_model_metrics():
+    reports_dir = os.path.join(PROCESSED_DIR, 'reports')
+    metrics = {}
+
+    ma_csv = os.path.join(reports_dir, 'model_a_binary_metrics.csv')
+    if os.path.exists(ma_csv):
+        df = pd.read_csv(ma_csv)
+        ma = {}
+        for _, row in df.iterrows():
+            model = row.get('model', row.get('strategy', 'unknown'))
+            if model in ('LR', 'SVM'):
+                ma[model.lower()] = {
+                    'accuracy':  float(row.get('accuracy', 0)),
+                    'precision': float(row.get('precision', 0)),
+                    'recall':    float(row.get('recall', 0)),
+                    'f1':        float(row.get('f1', 0)),
+                    '4way_acc':  float(row.get('4way_acc', 0)),
+                }
+        metrics['model_a'] = ma
+
+    ens_csv = os.path.join(reports_dir, 'model_a_ensemble_metrics.csv')
+    if os.path.exists(ens_csv):
+        ens_df = pd.read_csv(ens_csv)
+        if 'model_a' not in metrics:
+            metrics['model_a'] = {}
+        ens = {}
+        for _, row in ens_df.iterrows():
+            strat = str(row.get('strategy', ''))
+            ens[strat] = {
+                k: float(v) for k, v in row.items()
+                if k != 'strategy' and pd.notna(v)
+            }
+        metrics['model_a']['ensemble'] = ens
+
+    cos_csv = os.path.join(reports_dir, 'model_a_cosine_retrieval_metrics.csv')
+    if os.path.exists(cos_csv):
+        if 'model_a' not in metrics:
+            metrics['model_a'] = {}
+        metrics['model_a']['cosine_similarity'] = {
+            k: float(v) for k, v in pd.read_csv(cos_csv).iloc[0].items()
+            if k != 'strategy'
         }
 
+    gen_csv = os.path.join(reports_dir, 'model_a_text_generation_metrics.csv')
+    if os.path.exists(gen_csv):
+        metrics['text_generation'] = {
+            k: float(v) for k, v in pd.read_csv(gen_csv).iloc[0].items()
+        }
 
-if __name__ == "__main__":
-    print("Inference module loaded successfully.")
+    mb_csv = os.path.join(reports_dir, 'model_b_metrics.csv')
+    if os.path.exists(mb_csv):
+        mb = {}
+        for _, row in pd.read_csv(mb_csv).iterrows():
+            model = str(row.get('model', ''))
+            split = str(row.get('split', ''))
+            key = f"{model}_{split}"
+            mb[key] = {
+                'accuracy':  float(row.get('accuracy', 0)),
+                'f1':        float(row.get('f1', 0)),
+                'precision': float(row.get('precision', 0)),
+                'recall':    float(row.get('recall', 0)),
+            }
+        metrics['model_b'] = mb
+
+    return metrics
+
+
+if __name__ == '__main__':
+    sample = (
+        "The Amazon rainforest is often referred to as the lungs of the Earth. "
+        "It produces 20 percent of the world's oxygen and is home to more than "
+        "10 million species of plants, animals, and insects. The rainforest covers "
+        "5.5 million square kilometres across nine countries. Deforestation is one "
+        "of the biggest threats to this vital ecosystem. Scientists are urging "
+        "governments and companies to take immediate action to protect the forest."
+    )
+    result = run_inference(sample)
+    for i, q in enumerate(result['questions'], 1):
+        print(f"\n--- Question {i}/5 ---")
+        print(f"Q : {q['question']}")
+        for k, v in q['options'].items():
+            marker = " ← correct" if k == q['correct_label'] else ""
+            print(f"  {k}: {v}{marker}")
+    print(f"\nLatency: {result['latency_ms']} ms")

@@ -1,0 +1,146 @@
+# 📚 Intelligent Reading Comprehension & Quiz Generation System
+
+**Course:** Artificial Intelligence — BS (CS) Spring 2026  
+**Institution:** NUCES FAST, Islamabad Campus
+
+---
+
+## 🎯 Project Overview
+
+An AI-powered system that:
+
+1. Accepts a reading passage as input
+2. Generates a multiple-choice question (template-based + ML-ranked)
+3. Produces 4 options (1 correct + 3 ML-generated distractors)
+4. Verifies user answers (Logistic Regression + SVM ensemble)
+5. Provides graduated hints (extractive + ML-scored)
+6. Displays analytics via a Streamlit dashboard
+
+### Models
+
+| Model   | Task                         | Approach                                |
+| ------- | ---------------------------- | --------------------------------------- |
+| Model A | Answer Verification          | LR + SVM + K-Means + Soft-Vote Ensemble |
+| Model B | Distractor & Hint Generation | LR Ranker + Extractive Scorer           |
+
+---
+
+## 🗂️ Project Structure
+
+```
+race_rc_project/
+├── data/
+│   ├── raw/            ← Place train.csv / val.csv / test.csv here (RACE dataset)
+│   └── processed/      ← Auto-generated artefacts
+├── models/
+│   ├── model_a/traditional/
+│   └── model_b/traditional/
+├── src/
+│   ├── preprocessing.py
+│   ├── model_a_train.py
+│   ├── model_b_train.py
+│   ├── inference.py
+│   └── evaluate.py
+├── ui/
+│   └── app.py
+├── notebooks/
+│   └── EDA.ipynb
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## ⚙️ Setup Instructions
+
+### 1. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Download RACE Dataset
+
+Download from Kaggle: https://www.kaggle.com/datasets/ankitdhiman7/race-dataset  
+Place the training CSV in `C:\Users\mosaq\Desktop\AI Proj\race_rc_project\data\raw\` (e.g. `train.csv`, as used by `preprocessing.load_data()`).  
+The pipeline will split it into 80/10/10 automatically.
+
+### 3. Run Preprocessing
+
+```bash
+cd src
+python preprocessing.py
+```
+
+Optional: maximize cosine-similarity features (larger vocab + ngrams):
+
+```bash
+TFIDF_MAX_FEATURES=50000 TFIDF_MIN_DF=1 TFIDF_NGRAM_MAX=2 \
+OHE_MAX_FEATURES=50000 OHE_MIN_DF=1 OHE_NGRAM_MAX=2 \
+python preprocessing.py
+```
+
+### 4. Train Model A
+
+```bash
+python model_a_train.py
+```
+
+Metrics are automatically exported to `data/processed/reports/model_a_*.csv` files.
+
+### 5. Train Model B
+
+```bash
+python model_b_train.py
+```
+
+Metrics are automatically exported to `data/processed/reports/model_b_metrics.csv`.
+
+### 6. Evaluate
+
+```bash
+python evaluate.py
+```
+
+### 7. Launch Streamlit UI
+
+```bash
+cd ..
+streamlit run ui/app.py
+```
+
+> **Note:** The UI works in demo mode even without trained models, using rule-based inference.
+
+---
+
+## 📊 Evaluation Metrics
+
+- BLEU Score
+- ROUGE Score (ROUGE-1 / ROUGE-2 / ROUGE-L)
+- METEOR Score
+
+---
+
+## 🔬 Dataset
+
+RACE (ReAding Comprehension from Examinations) — Lai et al., EMNLP 2017  
+~28,000 passages · ~100,000 questions · Source: Chinese school English exams
+
+---
+
+## ⚠️ Ethical Notice
+
+Generated questions are AI-produced and must not be used in real exam settings without human review. The system clearly marks all outputs as AI-generated.
+
+---
+
+## 📸 Screenshots
+
+> Run the app and take screenshots to insert here.
+
+| Screen        | Description                          |
+| ------------- | ------------------------------------ |
+| Article Input | Paste passage or load RACE sample    |
+| Quiz View     | Answer MCQ with 4 options            |
+| Hint Panel    | Graduated hints (general → specific) |
+| Analytics     | Accuracy, F1, Confusion Matrix       |
