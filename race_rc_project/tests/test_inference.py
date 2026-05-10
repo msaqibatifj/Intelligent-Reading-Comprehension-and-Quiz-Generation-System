@@ -186,20 +186,20 @@ SAMPLE_ARTICLE = (
 
 
 def test_generate_questions_returns_list():
-    qs = generate_questions_from_passage(SAMPLE_ARTICLE, n_questions=3)
+    qs = generate_questions_from_passage(SAMPLE_ARTICLE, count=3)
     assert isinstance(qs, list)
     assert len(qs) > 0
 
 
 def test_each_question_is_dict():
-    qs = generate_questions_from_passage(SAMPLE_ARTICLE, n_questions=2)
+    qs = generate_questions_from_passage(SAMPLE_ARTICLE, count=2)
     for item in qs:
         assert isinstance(item, dict)
         assert 'question' in item and 'answer' in item
 
 
 def test_answer_not_identical_to_question():
-    qs = generate_questions_from_passage(SAMPLE_ARTICLE, n_questions=3)
+    qs = generate_questions_from_passage(SAMPLE_ARTICLE, count=3)
     ans = qs[0].get('answer', '')
     assert isinstance(ans, str) and len(ans) > 0
 
@@ -261,7 +261,7 @@ def test_run_inference_returns_dict():
 
 def test_run_inference_questions_count():
     result = run_inference(SAMPLE_ARTICLE)
-    assert 1 <= len(result['questions']) <= 5
+    assert 5 <= len(result['questions']) <= 10
 
 
 def test_run_inference_question_structure():

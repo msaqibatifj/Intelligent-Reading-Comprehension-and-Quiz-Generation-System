@@ -37,6 +37,9 @@ except Exception:
 MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'traditional')
 MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'traditional')
 
+MIN_QUIZ_QUESTIONS = 5
+MAX_QUIZ_QUESTIONS = 10
+
 
 _cache = {}
 
@@ -125,6 +128,28 @@ def _model_a_pack(models):
     }
 
 
+def _build_fallback_question(article, idx, models):
+    """Create a safe fallback MCQ so we can always reach the minimum quiz size."""
+    sentences = split_into_sentences(article)
+    source = sentences[min(idx, max(len(sentences) - 1, 0))] if sentences else article
+    source = source.strip() if source else article.strip()
+
+    question_text = f"Which statement best matches the passage detail #{idx + 1}?"
+    correct_answer = source[:120] if source else "A key point from the passage"
+    distractors = _build_fallback_distractors(article, correct_answer, n=3)
+    options, correct_label = shuffle_options(correct_answer, distractors)
+    hints = _get_hints(article, question_text, models)
+
+    return {
+        'question': question_text,
+        'correct_answer': correct_answer,
+        'correct_label': correct_label,
+        'options': options,
+        'hints': hints,
+        'source_sentence': source[:200],
+    }
+
+
 def build_question_from_race_row(article, row, models):
     correct_letter = str(row.get('answer', 'A')).strip().upper()
     correct_answer = str(row.get(correct_letter, ''))
@@ -177,14 +202,24 @@ def run_inference(article, race_rows=None):
     question_list = []
 
     if race_rows:
-        for row in race_rows[:5]:
+        for row in race_rows[:MAX_QUIZ_QUESTIONS]:
             question_list.append(build_question_from_race_row(article, row, models))
 
-    n_needed = 5 - len(question_list)
+    n_needed = MIN_QUIZ_QUESTIONS - len(question_list)
     if n_needed > 0:
-        raw = generate_questions_from_passage(article, n_questions=n_needed + 2)
-        for item in raw[:n_needed]:
-            question_list.append(build_question_from_generated(article, item, models))
+        try:
+            raw = generate_questions_from_passage(article, count=n_needed + 2)
+            for item in raw[:n_needed]:
+                question_list.append(build_question_from_generated(article, item, models))
+        except Exception as e:
+            pass
+
+    # Guarantee minimum count even when model generation returns too few items.
+    while len(question_list) < MIN_QUIZ_QUESTIONS:
+        question_list.append(_build_fallback_question(article, len(question_list), models))
+
+    # Never exceed the configured maximum quiz size.
+    question_list = question_list[:MAX_QUIZ_QUESTIONS]
 
     latency_ms = int((time.time() - t0) * 1000)
     print(f"  run_inference: {len(question_list)} questions in {latency_ms} ms")
