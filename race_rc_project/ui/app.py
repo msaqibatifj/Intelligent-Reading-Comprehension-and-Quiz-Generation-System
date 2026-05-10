@@ -621,9 +621,6 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.markdown("---")
-    clr = "🟢" if models_ok else "🟡"
-    lbl = "Trained models loaded" if models_ok else "Demo mode (rule-based)"
-    st.markdown(f"**Status:** {clr} {lbl}")
 
     result = st.session_state.get('result')
     if result:
@@ -672,63 +669,63 @@ if nav == "📝  Article Input":
     st.markdown('<div class="sec-header">📝 Provide a Reading Passage</div>',
                 unsafe_allow_html=True)
 
-    # ── Main two-column layout ───────────────────────────────────────────────
-    col_left, col_right = st.columns([3, 2], gap="large")
+    # ── Full-width passage input ───────────────────────────────────────────────
+    st.markdown('<div class="card card-indigo">', unsafe_allow_html=True)
+    article_input = st.text_area(
+        "✏️ Paste or type your reading passage (min 80 characters, 4–5 sentences):",
+        value=st.session_state.get('article', ''),
+        height=280,
+        placeholder="Enter an English reading passage here…\n\n"
+                     "Tip: click 'Random from Dataset' to load a sample.",
+        key='article_ta',
+    )
+    char_count = len(article_input)
+    st.caption(f"Characters: **{char_count}** / 80 minimum")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    with col_left:
-        st.markdown('<div class="card card-indigo">', unsafe_allow_html=True)
-        article_input = st.text_area(
-            "✏️ Paste or type your reading passage (min 80 characters, 4–5 sentences):",
-            value=st.session_state.get('article', ''),
-            height=280,
-            placeholder="Enter an English reading passage here…\n\n"
-                         "Tip: click 'Random from Dataset' to load a sample.",
-            key='article_ta',
+    # Action buttons
+    col_gen, col_clr = st.columns([5, 1])
+    with col_gen:
+        generate_clicked = st.button(
+            "🚀  Generate 5 Questions",
+            type="primary",
+            use_container_width=True,
         )
-        char_count = len(article_input)
-        st.caption(f"Characters: **{char_count}** / 80 minimum")
-        st.markdown('</div>', unsafe_allow_html=True)
+    with col_clr:
+        if st.button("🗑️", use_container_width=True, help="Clear passage"):
+            st.session_state['article'] = ''
+            reset_quiz()
+            st.rerun()
 
-        # Action buttons
-        col_gen, col_clr = st.columns([5, 1])
-        with col_gen:
-            generate_clicked = st.button(
-                "🚀  Generate 5 Questions",
-                type="primary",
-                use_container_width=True,
-            )
-        with col_clr:
-            if st.button("🗑️", use_container_width=True, help="Clear passage"):
-                st.session_state['article'] = ''
-                reset_quiz()
-                st.rerun()
+    if generate_clicked:
+        text = article_input.strip()
+        if len(text) < 80:
+            st.warning("⚠️ Please enter at least 80 characters.")
+        else:
+            race_rows = st.session_state.get('race_rows')
+            st.session_state['article'] = text
+            reset_quiz()
+            if race_rows:
+                st.session_state['race_rows'] = race_rows
 
-        if generate_clicked:
-            text = article_input.strip()
-            if len(text) < 80:
-                st.warning("⚠️ Please enter at least 80 characters.")
-            else:
-                race_rows = st.session_state.get('race_rows')
-                st.session_state['article'] = text
-                reset_quiz()
-                if race_rows:
-                    st.session_state['race_rows'] = race_rows
-
-                with st.spinner("⏳ Generating questions — please wait…"):
-                    t0 = time.time()
-                    result = run_inference_safe(
-                        text, race_rows=st.session_state.get('race_rows')
-                    )
-                    elapsed = int((time.time() - t0) * 1000)
-
-                st.session_state['result'] = result
-                n_q = len(result.get('questions', []))
-                st.success(
-                    f"✅ {n_q} questions generated in **{result.get('latency_ms', elapsed)} ms**! "
-                    "👉 Go to **🧠 Quiz** to start."
+            with st.spinner("⏳ Generating questions — please wait…"):
+                t0 = time.time()
+                result = run_inference_safe(
+                    text, race_rows=st.session_state.get('race_rows')
                 )
+                elapsed = int((time.time() - t0) * 1000)
 
-    with col_right:
+            st.session_state['result'] = result
+            n_q = len(result.get('questions', []))
+            st.success(
+                f"✅ {n_q} questions generated in **{result.get('latency_ms', elapsed)} ms**! "
+                "👉 Go to **🧠 Quiz** to start."
+            )
+
+    # ── Below: RACE Dataset + Preview ───────────────────────────────────────────
+    col_ds, col_prev = st.columns(2, gap="large")
+
+    with col_ds:
         # Load from RACE dataset
         st.markdown('<div class="card card-teal">', unsafe_allow_html=True)
         st.markdown("#### 🗂️ Load from RACE Dataset")
@@ -800,7 +797,7 @@ if nav == "📝  Article Input":
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # Article preview
+    with col_prev:
         article_now = st.session_state.get('article', '')
         if article_now:
             st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
