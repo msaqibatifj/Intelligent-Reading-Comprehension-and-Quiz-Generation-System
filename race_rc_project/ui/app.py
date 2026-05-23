@@ -8,10 +8,10 @@ import os, sys, random, time
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib  # type: ignore[reportMissingModuleSource]
+import matplotlib  
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt  # type: ignore[reportMissingModuleSource]
-import seaborn as sns  # type: ignore[reportMissingModuleSource]
+import matplotlib.pyplot as plt  
+import seaborn as sns  
 import joblib
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -37,22 +37,19 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@600;700&display=swap');
 
 :root {
-    --bg-0: #f7fafc;
-    --bg-1: #e6edf7;
-    --ink-1: #0f172a;
-    --ink-2: #334155;
-    --primary: #0f4c81;
-    --accent: #0ea5a6;
+    --bg-0: #1A1A1B; /* dark background */
+    --bg-1: #0b0b0c; /* darker band */
+    --ink-1: #F5F5F5; /* main text */
+    --ink-2: #DCDCDC; /* secondary text */
+    --primary: #D72638; /* red */
+    --accent: #D72638;
     --warm: #ea580c;
-    --ok: #047857;
-    --danger: #be123c;
+    --ok: #28a745;
+    --danger: #D72638;
 }
 
 .stApp {
-    background:
-        radial-gradient(1200px 420px at 10% -15%, #cde9ff 0%, transparent 60%),
-        radial-gradient(1000px 380px at 100% -25%, #d2f5f1 0%, transparent 55%),
-        linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 100%);
+    background: linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 100%);
     color: var(--ink-1);
     font-family: 'Manrope', sans-serif;
 }
@@ -78,20 +75,20 @@ h1, h2, h3, .banner-title {
 section[data-testid="stSidebar"] {
     left: auto !important;
     right: 0 !important;
-    border-left: 1px solid #c7d6ea;
-    background: linear-gradient(180deg, #eff6ff 0%, #e0f2fe 100%);
+    border-left: 1px solid rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%);
 }
 
 [data-testid="stSidebarNav"] { display: none; }
 button[kind="header"] { right: 1rem !important; left: auto !important; }
 
 section[data-testid="stSidebar"] * {
-    color: #0b2540 !important;
+    color: var(--ink-1) !important;
 }
 
 section[data-testid="stSidebar"] .stRadio > div {
-    background: rgba(255,255,255,0.7);
-    border: 1px solid #bfd4ec;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
     border-radius: 12px;
     padding: 0.4rem;
 }
@@ -105,44 +102,44 @@ section[data-testid="stSidebar"] .stRadio label {
 .stButton > button {
     min-height: 48px;
     border-radius: 12px;
-    border: 1px solid #1e3a5f;
-    background: linear-gradient(180deg, #111827 0%, #0b1220 100%);
-    color: #f8fafc !important;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, var(--bg-1) 0%, #070708 100%);
+    color: var(--ink-1) !important;
     font-weight: 700;
     font-size: 1.03rem;
-    box-shadow: 0 4px 10px rgba(15, 23, 42, 0.2);
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
 }
 
 .stButton > button p,
 .stButton > button span {
-    color: #f8fafc !important;
+    color: var(--ink-1) !important;
 }
 
 .stButton > button:hover {
-    border-color: #38bdf8;
-    background: linear-gradient(180deg, #172554 0%, #0f172a 100%);
+    border-color: var(--primary);
+    background: linear-gradient(180deg, rgba(0,0,0,0.35) 0%, rgba(0,0,0,0.45) 100%);
 }
 
 .stButton > button[kind="primary"] {
     border: none;
-    background: linear-gradient(135deg, #0ea5a6 0%, #0f766e 100%);
-    color: #f0fdfa !important;
+    background: linear-gradient(135deg, var(--primary) 0%, #a0172a 100%);
+    color: var(--ink-1) !important;
 }
 
 .stButton > button[kind="primary"] p,
 .stButton > button[kind="primary"] span {
-    color: #f0fdfa !important;
+    color: var(--ink-1) !important;
 }
 
 .stButton > button[kind="secondary"] {
-    border: 1px solid #0891b2;
-    background: linear-gradient(180deg, #ecfeff 0%, #cffafe 100%);
-    color: #0f172a !important;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%);
+    color: var(--ink-1) !important;
 }
 
 .stButton > button[kind="secondary"] p,
 .stButton > button[kind="secondary"] span {
-    color: #0f172a !important;
+    color: var(--ink-1) !important;
 }
 
 .stButton > button:disabled {
@@ -152,38 +149,38 @@ section[data-testid="stSidebar"] .stRadio label {
 
 /* Top banner */
 .top-banner {
-    background: linear-gradient(120deg, #0f4c81 0%, #127d9e 45%, #15aabf 100%);
+    background: linear-gradient(120deg, var(--primary) 0%, #a0172a 45%, #7a1015 100%);
     border-radius: 16px;
     padding: 1.2rem 1.6rem;
     margin-bottom: 1.1rem;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    border: 1px solid rgba(255,255,255,0.35);
-    box-shadow: 0 12px 30px rgba(15,76,129,0.22);
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 12px 30px rgba(215,38,56,0.18);
 }
 
 .banner-title {
     font-size: 1.7rem;
     font-weight: 700;
-    color: #f8fcff;
+    color: var(--ink-1);
     letter-spacing: -0.4px;
     margin: 0;
 }
 
 .banner-sub {
     font-size: 0.86rem;
-    color: #ddf2ff;
+    color: rgba(245,245,245,0.9);
     margin-top: 4px;
 }
 
 .banner-badge {
-    background: rgba(7, 30, 54, 0.25);
-    border: 1px solid rgba(255,255,255,0.28);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
     border-radius: 999px;
     padding: 5px 16px;
     font-size: 0.76rem;
-    color: #ecfeff;
+    color: var(--ink-1);
     font-weight: 700;
 }
 
@@ -193,130 +190,130 @@ section[data-testid="stSidebar"] .stRadio label {
     gap: 10px;
     font-size: 1.15rem;
     font-weight: 800;
-    color: #0f172a;
-    background: linear-gradient(90deg, #ffffff 0%, #dff5ff 100%);
+    color: var(--ink-1);
+    background: linear-gradient(90deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%);
     border-left: 6px solid var(--primary);
     border-radius: 0 12px 12px 0;
     padding: 10px 14px;
     margin: 0.7rem 0 1rem;
-    box-shadow: 0 3px 12px rgba(2, 32, 71, 0.08);
+    box-shadow: 0 3px 12px rgba(0,0,0,0.5);
 }
 
 .card {
-    background: rgba(255,255,255,0.92);
-    border: 1px solid #d2deee;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.04);
     border-radius: 14px;
     padding: 1.15rem 1.3rem;
     margin-bottom: 0.85rem;
-    box-shadow: 0 6px 18px rgba(3, 22, 49, 0.08);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.6);
 }
 
-.card-indigo { border-left: 6px solid #0f4c81; }
-.card-teal   { border-left: 6px solid #0d9488; }
-.card-amber  { border-left: 6px solid #ea580c; }
-.card-rose   { border-left: 6px solid #e11d48; }
+.card-indigo { border-left: 6px solid var(--primary); }
+.card-teal   { border-left: 6px solid var(--primary); }
+.card-amber  { border-left: 6px solid var(--warm); }
+.card-rose   { border-left: 6px solid var(--danger); }
 
-.quiz-q {
-    background: linear-gradient(135deg, #0f4c81 0%, #1d4ed8 100%);
-    color: #f8fdff;
+quiz-q {
+    background: linear-gradient(135deg, var(--primary) 0%, #a0172a 100%);
+    color: var(--ink-1);
     border-radius: 12px;
     padding: 1.05rem 1.3rem;
     font-size: 1.04rem;
     font-weight: 700;
     margin-bottom: 0.95rem;
-    box-shadow: 0 6px 16px rgba(9, 65, 125, 0.28);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.6);
     line-height: 1.5;
 }
 
 .result-correct {
-    background: linear-gradient(135deg, #ecfdf5, #d1fae5);
+    background: linear-gradient(135deg, rgba(40,167,69,0.06), rgba(0,0,0,0.02));
     border: 2px solid var(--ok);
     border-radius: 10px;
     padding: 0.9rem 1.2rem;
-    color: #064e3b;
+    color: var(--ink-1);
     font-weight: 700;
     font-size: 1rem;
 }
 
 .result-wrong {
-    background: linear-gradient(135deg, #fff1f2, #ffe4e6);
+    background: linear-gradient(135deg, rgba(215,38,56,0.06), rgba(0,0,0,0.02));
     border: 2px solid var(--danger);
     border-radius: 10px;
     padding: 0.9rem 1.2rem;
-    color: #881337;
+    color: var(--ink-1);
     font-weight: 700;
     font-size: 1rem;
 }
 
 .hint-unlocked {
-    background: linear-gradient(135deg, #fff7ed, #ffedd5);
+    background: linear-gradient(135deg, rgba(234,88,12,0.04), rgba(0,0,0,0.02));
     border-left: 5px solid var(--warm);
     border-radius: 8px;
     padding: 0.9rem 1.1rem;
     margin-bottom: 0.7rem;
-    color: #7c2d12;
+    color: var(--ink-1);
     font-size: 0.95rem;
 }
 
 .hint-locked {
-    background: #f8fafc;
-    border: 1px dashed #94a3b8;
+    background: rgba(255,255,255,0.02);
+    border: 1px dashed rgba(255,255,255,0.06);
     border-radius: 8px;
     padding: 0.75rem 1.1rem;
     margin-bottom: 0.7rem;
-    color: #475569;
+    color: var(--ink-2);
     font-size: 0.9rem;
 }
 
 .m-card {
-    background: #ffffff;
+    background: rgba(255,255,255,0.02);
     border-radius: 13px;
     padding: 0.95rem 0.8rem;
     text-align: center;
-    border: 1px solid #d1dded;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+    border: 1px solid rgba(255,255,255,0.04);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.6);
 }
 
 .m-val {
     font-size: 1.72rem;
     font-weight: 900;
-    color: #0f172a;
+    color: var(--ink-1);
     line-height: 1.1;
 }
 
 .m-lbl {
     font-size: 0.8rem;
-    color: #475569;
+    color: var(--ink-2);
     margin-top: 5px;
     font-weight: 700;
 }
 
 .gen-card {
-    background: linear-gradient(135deg, #ecfeff 0%, #ccfbf1 100%);
-    border: 2px solid #0f766e;
+    background: linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%);
+    border: 2px solid rgba(255,255,255,0.04);
     border-radius: 12px;
     padding: 1rem;
     text-align: center;
 }
 
-.gen-val { font-size: 1.9rem; font-weight: 900; color: #134e4a; }
-.gen-lbl { font-size: 0.78rem; color: #115e59; font-weight: 700; margin-top: 4px; }
+.gen-val { font-size: 1.9rem; font-weight: 900; color: var(--ink-1); }
+.gen-lbl { font-size: 0.78rem; color: var(--ink-2); font-weight: 700; margin-top: 4px; }
 
 .cos-card {
-    background: linear-gradient(135deg, #dbeafe 0%, #e0e7ff 100%);
-    border: 2px solid #1d4ed8;
+    background: linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%);
+    border: 2px solid rgba(255,255,255,0.04);
     border-radius: 12px;
     padding: 1rem;
     text-align: center;
 }
 
-.cos-val { font-size: 1.9rem; font-weight: 900; color: #1e3a8a; }
-.cos-lbl { font-size: 0.78rem; color: #1d4ed8; font-weight: 700; margin-top: 4px; }
+.cos-val { font-size: 1.9rem; font-weight: 900; color: var(--ink-1); }
+.cos-lbl { font-size: 0.78rem; color: var(--primary); font-weight: 700; margin-top: 4px; }
 
 .q-pill {
     display: inline-block;
-    background: linear-gradient(90deg, #0f4c81, #0ea5a6);
-    color: #ffffff;
+    background: linear-gradient(90deg, var(--primary), #a0172a);
+    color: var(--ink-1);
     border-radius: 999px;
     padding: 4px 18px;
     font-size: 0.82rem;
@@ -326,21 +323,21 @@ section[data-testid="stSidebar"] .stRadio label {
 }
 
 .article-preview {
-    background: linear-gradient(180deg, #172554 0%, #1e3a8a 100%);
-    color: #dbeafe;
+    background: linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 100%);
+    color: var(--ink-1);
     border-radius: 10px;
     padding: 1rem 1.2rem;
     font-size: 0.88rem;
     line-height: 1.62;
     max-height: 500px;
     overflow-y: auto;
-    border: 1px solid #1d4ed8;
+    border: 1px solid rgba(255,255,255,0.06);
     white-space: pre-wrap;
 }
 
 .dataset-badge {
-    background: #0f766e;
-    color: #f0fdfa;
+    background: var(--primary);
+    color: var(--ink-1);
     border-radius: 6px;
     padding: 3px 10px;
     font-size: 0.72rem;
@@ -423,7 +420,8 @@ def fallback_inference(article, race_rows=None):
                 'hints':          hints,
                 'source_sentence': article[:200],
             })
-        return {'questions': q_list, 'latency_ms': 0}
+        
+        return {'questions': q_list[:5], 'latency_ms': 0}
 
     # Template-based for custom passage
     sw = {'a','an','the','is','it','in','on','at','to','for','of','and','or',
@@ -1043,7 +1041,7 @@ elif nav == "📊  Analytics":
         [s1, s2, s3, s4],
         [n_total, n_correct, n_total - n_correct, f"{sess_acc:.0%}"],
         ["Answered", "Correct ✅", "Incorrect ❌", "Session Accuracy"],
-        ["#4338ca", "#059669", "#e11d48", "#d97706"],
+        ["#D72638", "#28a745", "#a0172a", "#F59E0B"],
     ):
         col.markdown(
             f'<div class="m-card" style="border-top:4px solid {clr};">'
@@ -1129,7 +1127,7 @@ elif nav == "📊  Analytics":
             labels = ['BLEU', 'METEOR', 'ROUGE-1\nF1', 'ROUGE-2\nF1', 'ROUGE-L\nF1']
             values = [gen_m.get(k, 0) for k in
                       ['bleu','meteor','rouge1_f','rouge2_f','rougeL_f']]
-            colors = ['#0f4c81','#0ea5a6','#047857','#16a34a','#34d399']
+            colors = ['#D72638', '#28a745', '#F59E0B', '#6B7280', '#a0172a']
             fig, ax = plt.subplots(figsize=(8, 3.5))
             bars = ax.bar(labels, values, color=colors, alpha=0.9, width=0.55)
             ax.set_ylim(0, max(max(values)*1.4, 0.15))
@@ -1177,7 +1175,7 @@ elif nav == "📊  Analytics":
         fig, ax = plt.subplots(figsize=(6, 3))
         vals = [cos_d.get('avg_correct_sim', 0), cos_d.get('avg_wrong_sim', 0)]
         bars = ax.bar(['Correct Option', 'Wrong Options'], vals,
-                      color=['#047857', '#be123c'], alpha=0.88)
+                  color=['#28a745', '#D72638'], alpha=0.88)
         ax.set_ylim(0, max(vals)*1.35+0.01)
         ax.set_ylabel('Mean TF-IDF Cosine Similarity')
         ax.set_title('Article ↔ Option Cosine Similarity')
@@ -1209,9 +1207,9 @@ elif nav == "📊  Analytics":
     with col_chart:
         x, w = np.arange(5), 0.28
         fig, ax = plt.subplots(figsize=(8, 3.5))
-        ax.bar(x-0.5*w, df_ma['LR'],       w, label='LR', color='#0f4c81', alpha=0.88)
-        ax.bar(x+0.5*w, df_ma['SVM'],      w, label='SVM', color='#0ea5a6', alpha=0.88)
-        ax.bar(x+1.5*w, df_ma['Ensemble'], w, label='Soft Ensemble', color='#047857', alpha=0.88)
+        ax.bar(x-0.5*w, df_ma['LR'],       w, label='LR', color='#D72638', alpha=0.88)
+        ax.bar(x+0.5*w, df_ma['SVM'],      w, label='SVM', color='#a0172a', alpha=0.88)
+        ax.bar(x+1.5*w, df_ma['Ensemble'], w, label='Soft Ensemble', color='#28a745', alpha=0.88)
         ax.set_xticks(x)
         ax.set_xticklabels(df_ma['Metric'], rotation=20, ha='right')
         ax.set_ylim(0, 1)
@@ -1257,7 +1255,7 @@ elif nav == "📊  Analytics":
         x, w = np.arange(4), 0.35
         fig3, ax3 = plt.subplots(figsize=(7, 3.5))
         ax3.bar(x-0.5*w, df_b['Distractor Val'], w, label='Distractor', color='#ea580c', alpha=0.9)
-        ax3.bar(x+0.5*w, df_b['Hint Val'],       w, label='Hint Scorer', color='#0ea5a6', alpha=0.9)
+        ax3.bar(x+0.5*w, df_b['Hint Val'],       w, label='Hint Scorer', color='#D72638', alpha=0.9)
         ax3.set_xticks(x)
         ax3.set_xticklabels(df_b['Metric'])
         ax3.set_ylim(0, 1)
@@ -1287,9 +1285,9 @@ elif nav == "📊  Analytics":
                 latencies = [r.get('latency_ms', 0) for r in log]
                 fig4, ax4 = plt.subplots(figsize=(7, 2.5))
                 ax4.plot(range(1, len(latencies)+1), latencies,
-                         marker='o', color='#0f4c81', linewidth=2, markersize=5)
+                         marker='o', color='#D72638', linewidth=2, markersize=5)
                 ax4.fill_between(range(1, len(latencies)+1), latencies,
-                                 alpha=0.14, color='#0f4c81')
+                                 alpha=0.14, color='#D72638')
                 ax4.set_xlabel('Request #')
                 ax4.set_ylabel('ms')
                 ax4.set_title('Inference Latency per Request')

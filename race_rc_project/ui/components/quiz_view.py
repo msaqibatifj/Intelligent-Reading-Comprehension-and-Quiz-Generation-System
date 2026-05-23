@@ -104,26 +104,27 @@ def render_quiz_options():
         
         with col2:
             # Determine styling based on state
+            user_answer = st.session_state.get('user_answer', None)
             if answer_revealed:
                 if idx == correct_idx:
-                    bg_style = "background-color: #28a745; color: white; border-color: #28a745;"
+                    bg_style = "background-color: var(--ok, #28a745); color: var(--text, white); border-color: var(--ok, #28a745);"
                     indicator = " ✅"
-                elif st.session_state.user_answer == idx:
-                    bg_style = "background-color: #dc3545; color: white; border-color: #dc3545;"
+                elif user_answer == idx:
+                    bg_style = "background-color: var(--danger, #dc3545); color: var(--text, white); border-color: var(--danger, #dc3545);"
                     indicator = " ❌"
                 else:
                     bg_style = "opacity: 0.6;"
                     indicator = ""
             else:
-                if st.session_state.user_answer == idx:
-                    bg_style = "background-color: #1f77b4; color: white;"
+                if user_answer == idx:
+                    bg_style = "background-color: var(--primary, #1f77b4); color: var(--text, white);"
                     indicator = ""
                 else:
                     bg_style = ""
                     indicator = ""
             
             st.markdown(
-                f'<div style="padding: 15px; border: 2px solid #ddd; border-radius: 8px; {bg_style}">{option_text}{indicator}</div>', 
+                f'<div style="padding: 15px; border: 2px solid rgba(255,255,255,0.08); border-radius: 8px; {bg_style}">{option_text}{indicator}</div>', 
                 unsafe_allow_html=True
             )
 

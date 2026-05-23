@@ -281,7 +281,7 @@ def _save_generation_metrics_plot(gen_metrics):
         gen_metrics.get('rouge2_f', 0),
         gen_metrics.get('rougeL_f', 0),
     ]
-    colors = ['#4f46e5', '#0891b2', '#059669', '#10b981', '#34d399']
+    colors = ['#D72638', '#a0172a', '#28a745', '#F59E0B', '#6B7280']
 
     fig, ax = plt.subplots(figsize=(9, 4))
     bars = ax.bar(labels, values, color=colors, alpha=0.88, width=0.55)
@@ -289,7 +289,7 @@ def _save_generation_metrics_plot(gen_metrics):
     ax.set_ylabel('Score', fontsize=11)
     ax.set_title('Generation Evaluation — BLEU / ROUGE / METEOR',
                  fontsize=13, fontweight='bold')
-    ax.axhline(y=0, color='#334155', linewidth=0.8)
+    ax.axhline(y=0, color='#6B7280', linewidth=0.8)
     for bar, v in zip(bars, values):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
                 f'{v:.4f}', ha='center', va='bottom',
@@ -344,16 +344,16 @@ def _save_cosine_sim_plot(tfidf_vec, eval_df):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
     fig.suptitle('TF-IDF Cosine Similarity: Correct vs Wrong Options',
                  fontsize=13, fontweight='bold')
-    axes[0].hist(correct_sims, bins=30, alpha=0.75, color='#059669', label='Correct')
-    axes[0].hist(wrong_sims,   bins=30, alpha=0.75, color='#dc2626', label='Wrong')
-    axes[0].axvline(np.mean(correct_sims), color='#059669', lw=2, ls='--')
-    axes[0].axvline(np.mean(wrong_sims),   color='#dc2626', lw=2, ls='--')
+    axes[0].hist(correct_sims, bins=30, alpha=0.75, color='#28a745', label='Correct')
+    axes[0].hist(wrong_sims,   bins=30, alpha=0.75, color='#D72638', label='Wrong')
+    axes[0].axvline(np.mean(correct_sims), color='#28a745', lw=2, ls='--')
+    axes[0].axvline(np.mean(wrong_sims),   color='#D72638', lw=2, ls='--')
     axes[0].set_xlabel('Cosine Similarity'); axes[0].set_ylabel('Count')
     axes[0].legend(); axes[0].set_title('Distribution')
     means = [np.mean(correct_sims), np.mean(wrong_sims)]
     stds  = [np.std(correct_sims),  np.std(wrong_sims)]
     bars  = axes[1].bar(['Correct', 'Wrong'], means, yerr=stds,
-                        color=['#059669', '#dc2626'], alpha=0.85,
+                        color=['#28a745', '#D72638'], alpha=0.85,
                         capsize=8, error_kw={'linewidth': 2})
     axes[1].set_ylabel('Mean Cosine Similarity'); axes[1].set_title('Mean ± Std')
     for bar, m in zip(bars, means):
