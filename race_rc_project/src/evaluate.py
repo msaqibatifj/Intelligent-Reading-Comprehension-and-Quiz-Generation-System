@@ -35,7 +35,11 @@ from sklearn.metrics import (
 from scipy.sparse import load_npz
 import joblib
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+except NameError:
+    PROJECT_ROOT = os.getcwd()
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -47,9 +51,10 @@ from src.model_a_train import (
     compute_generation_metrics as ma_compute_generation_metrics,
     generate_questions_from_passage,
 )
+from src.nn_models import AnswerVerifier, load_checkpoint
 
-MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'traditional')
-MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'traditional')
+MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'neural')
+MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'neural')
 REPORTS_DIR = os.path.join(PROCESSED_DIR, 'reports')
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
@@ -373,55 +378,46 @@ def evaluate_model_a(ohe_vec, test_df, tfidf_vec=None):
 
     X_te_path = os.path.join(PROCESSED_DIR, 'X_test_ohe.npz')
     y_te_path  = os.path.join(PROCESSED_DIR, 'y_test.npy')
-    model_specs = [
-        ('logistic_regression.pkl', 'Logistic Regression'),
-        ('svm.pkl',                 'SVM'),
-    ]
     results = {}
+
+    # Load NN checkpoint
+    nn_path = os.path.join(MODEL_A_DIR, 'answer_verifier.pt')
+    if not os.path.exists(nn_path):
+        print("  WARNING: NN checkpoint not found. Skipping Model A evaluation.")
+        return results
+
+    model = load_checkpoint(AnswerVerifier, nn_path)
 
     if os.path.exists(X_te_path) and os.path.exists(y_te_path):
         print_subsection("Binary classification (is option correct?)")
         X_te = load_npz(X_te_path)
         y_te = np.load(y_te_path)
-        for filename, label in model_specs:
-            path = os.path.join(MODEL_A_DIR, filename)
-            if not os.path.exists(path):
-                continue
-            model = joblib.load(path)
-            preds = model.predict(X_te)
-            acc = accuracy_score(y_te, preds)
-            p   = precision_score(y_te, preds, average='macro', zero_division=0)
-            r   = recall_score(y_te,    preds, average='macro', zero_division=0)
-            f1  = f1_score(y_te,        preds, average='macro', zero_division=0)
-            cm  = confusion_matrix(y_te, preds)
-            print(f"    {label:<30}: Acc={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
-            # Save confusion matrix plot
-            fig, ax = plt.subplots(figsize=(5, 4))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                        xticklabels=['Incorrect', 'Correct'],
-                        yticklabels=['Incorrect', 'Correct'], ax=ax)
-            ax.set_title(f'{label} — Confusion Matrix')
-            ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
-            plt.tight_layout()
-            cm_path = os.path.join(REPORTS_DIR,
-                                   f"{label.lower().replace(' ','_')}_cm.png")
-            plt.savefig(cm_path, dpi=100); plt.close()
-            key = label.lower().replace(' ', '_')
-            results[key] = {'accuracy': acc, 'precision': p, 'recall': r,
-                            'f1': f1, 'confusion_matrix': cm}
+        preds = model.predict(X_te)
+        acc = accuracy_score(y_te, preds)
+        p   = precision_score(y_te, preds, average='macro', zero_division=0)
+        r   = recall_score(y_te,    preds, average='macro', zero_division=0)
+        f1  = f1_score(y_te,        preds, average='macro', zero_division=0)
+        cm  = confusion_matrix(y_te, preds)
+        print(f"    {'NN':<30}: Acc={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
+        # Save confusion matrix plot
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Incorrect', 'Correct'],
+                    yticklabels=['Incorrect', 'Correct'], ax=ax)
+        ax.set_title('NN — Confusion Matrix')
+        ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+        plt.tight_layout()
+        cm_path = os.path.join(REPORTS_DIR, 'nn_cm.png')
+        plt.savefig(cm_path, dpi=100); plt.close()
+        results['nn'] = {'accuracy': acc, 'precision': p, 'recall': r,
+                         'f1': f1, 'confusion_matrix': cm}
 
     print_subsection("4-way MCQ accuracy")
-    for filename, label in model_specs:
-        path = os.path.join(MODEL_A_DIR, filename)
-        if not os.path.exists(path):
-            continue
-        model  = joblib.load(path)
-        acc_4w = compute_4way_accuracy(model, ohe_vec, test_df)
-        print(f"    {label:<30}: {acc_4w:.4f}  ({acc_4w*100:.1f}%)")
-        key = label.lower().replace(' ', '_')
-        if key not in results:
-            results[key] = {}
-        results[key]['4way_acc'] = acc_4w
+    acc_4w = compute_4way_accuracy(model, ohe_vec, test_df)
+    print(f"    {'NN':<30}: {acc_4w:.4f}  ({acc_4w*100:.1f}%)")
+    if 'nn' not in results:
+        results['nn'] = {}
+    results['nn']['4way_acc'] = acc_4w
 
     return results
 
@@ -472,8 +468,7 @@ def print_summary(gen_results, cos_results, ma_results):
         print(f"  │ {'Cosine Similarity Accuracy':<40}  {cos_results.get('accuracy',0):>8.4f} │")
         print(f"  │ {'Similarity Gap (correct−wrong)':<40}  {cos_results.get('sim_gap',0):>8.4f} │")
         print(f"  ├{'─'*52}┤")
-    for key, lbl in [('logistic_regression', 'LR binary accuracy'),
-                      ('svm',                 'SVM binary accuracy')]:
+    for key, lbl in [('nn', 'NN binary accuracy')]:
         v = ma_results.get(key, {}).get('accuracy')
         if v is not None:
             print(f"  │ {lbl:<40}  {v:>8.4f} │")
@@ -524,19 +519,19 @@ def run_full_evaluation():
     )
 
     # ── MODEL A (binary + 4-way) ───────────────────────────────────────────
-    # ma_results = evaluate_model_a(ohe_vec, test_df, tfidf_vec=tfidf_vec)
+    ma_results = evaluate_model_a(ohe_vec, test_df, tfidf_vec=tfidf_vec)
 
     # ── MODEL B ───────────────────────────────────────────────────────────
-    # mb_results = evaluate_model_b()
+    mb_results = evaluate_model_b()
 
     # ── SUMMARY ───────────────────────────────────────────────────────────
-    # print_summary(gen_results, cos_results, ma_results)
+    print_summary(gen_results, cos_results, ma_results)
 
     all_metrics = {
         'generation':       gen_results,
         'cosine_similarity': cos_results,
-        # 'model_a':          ma_results,
-        # 'model_b':          mb_results,
+        'model_a':          ma_results,
+        'model_b':          mb_results,
     }
     out_path = os.path.join(REPORTS_DIR, 'all_metrics.pkl')
     joblib.dump(all_metrics, out_path)

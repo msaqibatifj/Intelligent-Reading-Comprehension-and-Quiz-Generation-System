@@ -1,34 +1,23 @@
 """
-verifier_a.py
-=============
+model_a_train.py
+================
 Answer Verification + MCQ Generation  (Model A)
 
-Classifier ensemble
--------------------
-  Logistic Regression   — binary answer scorer, balanced classes, liblinear
-  Calibrated SVM        — LinearSVC with Platt-scaling for probability output
-  K-Means               — unsupervised cluster analysis of OHE feature space
-  Label Propagation     — semi-supervised graph label spread
+Models:
+  AnswerVerifier (feed-forward NN on OHE features)
+  TransformerAnswerVerifier (BERT/RoBERTa + LoRA)  — optional
 
-Ensemble strategies
--------------------
-  Soft blend    — averaged class probabilities from LR + SVM
-  Hard vote     — majority rule, ties broken by LR
-  Stacking      — meta-LR trained on validation-set probability outputs
-
-MCQ generation pipeline
------------------------
+MCQ generation pipeline:
   Phase 1 — candidate sentence extraction (keyword-overlap scoring)
   Phase 2 — Wh-word template instantiation
   Phase 3 — ML / heuristic question ranking
   Phase 4 — distractor assembly from article sentences
 
-Evaluation metrics
-------------------
-  Binary classification : Accuracy, Precision, Recall, Macro-F1, Exact Match
-  4-way MCQ accuracy    : pick best option by predicted P(correct)
-  Cosine-sim accuracy   : TF-IDF retrieval baseline
-  Text generation       : BLEU, ROUGE-1/2/L, METEOR
+Evaluation:
+  Binary classification: Accuracy, Precision, Recall, Macro-F1
+  4-way MCQ accuracy
+  Cosine-sim accuracy (TF-IDF)
+  Text generation: BLEU, ROUGE-1/2/L, METEOR
 """
 
 from __future__ import annotations
@@ -47,21 +36,22 @@ from typing import Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix, hstack as sparse_hstack, load_npz
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    silhouette_score,
-)
+import torch
+from scipy.sparse import load_npz, hstack as sparse_hstack
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.metrics.pairwise import cosine_similarity as _sk_cos
-from sklearn.semi_supervised import LabelPropagation
-from sklearn.svm import LinearSVC
 from tqdm import tqdm
+
+from src.nn_models import (
+    AnswerVerifier,
+    DistractorScorer,
+    HintScorer,
+    DEVICE,
+    load_checkpoint,
+    save_checkpoint,
+    train_nn,
+)
+from src.preprocessing import clean_text
 
 warnings.filterwarnings("ignore")
 
@@ -73,9 +63,13 @@ warnings.filterwarnings("ignore")
 # _THIS_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working/data"
 # ARTIFACT_DIR = os.path.join(_THIS_DIR, "..", "data", "processed")
 
-# Kaggle paths (active)
-_THIS_DIR = "/kaggle/working/src"
-ARTIFACT_DIR = "/kaggle/working/data/processed"
+# Local paths
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_PROJ  = os.path.normpath(os.path.join(_THIS_DIR, ".."))
+except NameError:
+    BASE_PROJ = os.getcwd()
+ARTIFACT_DIR = os.path.join(BASE_PROJ, "data", "processed")
 PROCESSED_DIR = ARTIFACT_DIR
 
 sys.path.insert(0, _THIS_DIR)
@@ -138,8 +132,8 @@ def make_sample_string(article, question, option):
 # _REPORTS_DEST = os.path.join(ARTIFACT_DIR, "reports")
 
 # Kaggle paths (active)
-_MODEL_DEST   = "/kaggle/working/models/model_a/traditional"
-_REPORTS_DEST = "/kaggle/working/data/processed/reports"
+_MODEL_DEST   = os.path.join(BASE_PROJ, "models", "model_a", "neural")
+_REPORTS_DEST = os.path.join(ARTIFACT_DIR, "reports")
 os.makedirs(_MODEL_DEST,   exist_ok=True)
 os.makedirs(_REPORTS_DEST, exist_ok=True)
 
@@ -188,217 +182,60 @@ def _integrity_check(X_tr, y_tr, X_va, y_va) -> dict:
 # SECTION 2 — Internal matrix helpers
 # ---------------------------------------------------------------------------
 
-def _subsample(X, y, ceiling: int):
-    if X.shape[0] <= ceiling:
-        return X, y
-    rng = np.random.RandomState(_RNG_SEED)
-    idx = rng.choice(X.shape[0], ceiling, replace=False)
-    return X[idx], y[idx]
 
-
-def _shuffle_rows(X, y):
-    rng  = np.random.RandomState(_RNG_SEED)
-    perm = rng.permutation(X.shape[0])
-    return X[perm], y[perm]
-
-
-def _to_dense(X) -> np.ndarray:
-    return X.toarray() if hasattr(X, "toarray") else np.asarray(X)
-
-
-def _standardise(X) -> np.ndarray:
-    d   = _to_dense(X)
-    mu  = d.mean(0)
-    sig = d.std(0)
-    return (d - mu) / (sig + 1e-9)
-
-
-def _minmax_scale(X) -> np.ndarray:
-    d  = _to_dense(X)
-    lo = d.min(0)
-    hi = d.max(0)
-    return (d - lo) / (hi - lo + 1e-9)
-
-
-def _log_scale(X) -> np.ndarray:
-    d = _to_dense(X)
-    return np.log1p(np.abs(d))
-
-
-def _rescale(X, strategy: str = "none"):
-    if strategy == "standardise": return _standardise(X)
-    if strategy == "minmax":      return _minmax_scale(X)
-    if strategy == "log":         return _log_scale(X)
-    return X
-
-# kept for compatibility
-preprocess_feature_matrix = _rescale
 
 
 # ---------------------------------------------------------------------------
-# SECTION 3 — Supervised classifiers
+# SECTION 3 — Neural network classifier (replaces LR + SVM)
 # ---------------------------------------------------------------------------
 
-def fit_logistic(X_tr, y_tr, **kw) -> LogisticRegression:
+def _stack_hc(X, hc):
+    """Stack handcrafted dense features onto sparse OHE matrix."""
+    if hc is None or hc.shape[1] == 0:
+        return X
+    return sparse_hstack([X, hc.astype(np.float32)], format="csr")
+
+
+def fit_answer_verifier(X_tr, y_tr, X_va=None, y_va=None, hc_tr=None, hc_va=None, **kw) -> AnswerVerifier:
     """
-    Logistic Regression for binary answer verification.
-    class_weight='balanced' corrects the 3:1 wrong-to-correct label ratio.
-    Capped at 140 000 rows so sparse OHE matrices remain tractable.
+    Train a feed-forward neural network on OHE + handcrafted features.
+    Loss is weighted by the inverse class frequency to handle
+    the ≈3:1 wrong-to-correct ratio.  Early stopping on validation loss.
     """
-    print("[A] LR", end="", flush=True)
-    X_tr, y_tr = _subsample(X_tr, y_tr, 140_000)
-    X_tr = _rescale(X_tr, kw.get("rescale", "none"))
-    clf = LogisticRegression(
-        max_iter     = kw.get("max_iter",      300),
-        C            = kw.get("C",             1.0),
-        class_weight = "balanced",
-        solver       = "liblinear",
-        tol          = kw.get("tol",           1e-3),
-        random_state = kw.get("random_state",  _RNG_SEED),
+    print("[A] NN", end="", flush=True)
+    X_tr = _stack_hc(X_tr, hc_tr)
+    if X_va is not None:
+        X_va = _stack_hc(X_va, hc_va)
+    input_dim = X_tr.shape[1]
+    pos = y_tr.sum()
+    neg = len(y_tr) - pos
+    pos_weight = neg / max(pos, 1)          # ≈3.0 for the RACE dataset
+
+    model = AnswerVerifier(
+        input_dim=input_dim,
+        hidden_dims=kw.get("hidden_dims", [512, 128]),
+        dropout=kw.get("dropout", 0.3),
     )
-    clf.fit(X_tr, y_tr)
-    print(" ✓")
-    return clf
-
-# compat alias
-train_logistic_regression = fit_logistic
-
-
-def fit_svm(X_tr, y_tr, **kw) -> CalibratedClassifierCV:
-    """
-    LinearSVC wrapped in CalibratedClassifierCV (Platt scaling) to expose
-    predict_proba needed for soft voting and stacking. Capped at 100 000 rows.
-    """
-    print("[A] SVM", end="", flush=True)
-    X_tr, y_tr = _subsample(X_tr, y_tr, 100_000)
-    X_tr = _rescale(X_tr, kw.get("rescale", "none"))
-    base = LinearSVC(
-        max_iter     = kw.get("max_iter",      1_000),
-        C            = kw.get("C",             0.5),
-        class_weight = "balanced",
-        tol          = kw.get("tol",           1e-3),
-        random_state = kw.get("random_state",  _RNG_SEED),
+    model = train_nn(
+        model,
+        X_tr, y_tr,
+        X_val=X_va, y_val=y_va,
+        epochs=kw.get("epochs", 30),
+        batch_size=kw.get("batch_size", 256),
+        lr=kw.get("lr", 1e-3),
+        weight_decay=kw.get("weight_decay", 1e-4),
+        pos_weight=pos_weight,
+        patience=kw.get("patience", 5),
+        verbose=True,
     )
-    clf = CalibratedClassifierCV(base, cv=kw.get("cv", 2))
-    clf.fit(X_tr, y_tr)
     print(" ✓")
-    return clf
+    return model
 
 # compat alias
-train_svm = fit_svm
+train_answer_verifier = fit_answer_verifier
 
 
-# ---------------------------------------------------------------------------
-# SECTION 4 — Unsupervised: K-Means
-# ---------------------------------------------------------------------------
 
-def fit_kmeans(X_tr, k: int = 4) -> KMeans:
-    """
-    K-Means on OHE features — finds latent answer-pattern clusters.
-    Subsampled to 8 000 points for efficiency.
-    """
-    print("[A] K-Means", end="", flush=True)
-    cap   = min(8_000, X_tr.shape[0])
-    picks = np.random.choice(X_tr.shape[0], cap, replace=False)
-    Xs    = X_tr[picks]
-    km    = KMeans(n_clusters=k, random_state=_RNG_SEED, n_init=10, max_iter=300)
-    km.fit(Xs)
-    print(" ✓")
-    try:
-        sil = silhouette_score(Xs, km.labels_, sample_size=min(2_000, cap))
-        print(f"         cohesion={sil:.4f}")
-    except Exception:
-        pass
-    return km
-
-# compat alias
-train_kmeans = fit_kmeans
-
-
-# ---------------------------------------------------------------------------
-# SECTION 5 — Semi-supervised: Label Propagation
-# ---------------------------------------------------------------------------
-
-def fit_label_propagation(
-    X_tr, y_tr, unlabelled_frac: float = 0.30
-) -> LabelPropagation:
-    """
-    Simulates partially-labelled data by masking some labels to -1,
-    then propagates via a KNN graph kernel. Operates on 4 500 rows.
-    """
-    print("[A] LabelProp", end="", flush=True)
-    n    = min(4_500, X_tr.shape[0])
-    idx  = np.random.choice(X_tr.shape[0], n, replace=False)
-    Xd   = _to_dense(X_tr[idx])
-    ys   = y_tr[idx].copy()
-
-    mask     = np.random.rand(n) < unlabelled_frac
-    y_masked = ys.copy()
-    y_masked[mask] = -1
-
-    lp = LabelPropagation(kernel="knn", n_neighbors=7, max_iter=1_000)
-    lp.fit(Xd, y_masked)
-    print(" ✓")
-    if mask.sum() > 0:
-        score = accuracy_score(ys[mask], lp.predict(Xd[mask]))
-        print(f"         propagation-score={score:.4f}")
-    return lp
-
-# compat alias
-train_label_propagation = fit_label_propagation
-
-
-# ---------------------------------------------------------------------------
-# SECTION 6 — Ensemble strategies
-# ---------------------------------------------------------------------------
-
-def _avg_proba(clf_a, clf_b, X) -> np.ndarray:
-    """Average class-probability outputs of two calibrated classifiers."""
-    return (clf_a.predict_proba(X) + clf_b.predict_proba(X)) / 2.0
-
-
-def soft_blend_predict(clf_a, clf_b, X) -> np.ndarray:
-    return np.argmax(_avg_proba(clf_a, clf_b, X), axis=1)
-
-# compat alias
-ensemble_soft_predict = soft_blend_predict
-
-
-def hard_blend_predict(clf_a, clf_b, X) -> np.ndarray:
-    """Majority vote; ties resolved in favour of clf_a."""
-    pa = clf_a.predict(X)
-    pb = clf_b.predict(X)
-    return np.where(pa == pb, pa, pa)
-
-# compat alias
-ensemble_hard_predict = hard_blend_predict
-
-
-def fit_meta_learner(clf_a, clf_b, X_val, y_val) -> LogisticRegression:
-    """Train a Logistic meta-learner on validation-set probability outputs."""
-    print("[A] meta-LR", end="", flush=True)
-    meta_X = np.column_stack([
-        clf_a.predict_proba(X_val)[:, 1],
-        clf_b.predict_proba(X_val)[:, 1],
-    ])
-    meta = LogisticRegression(max_iter=500, random_state=_RNG_SEED)
-    meta.fit(meta_X, y_val)
-    print(" ✓")
-    return meta
-
-# compat alias
-train_stacking_meta = fit_meta_learner
-
-
-def stacked_predict(meta, clf_a, clf_b, X) -> np.ndarray:
-    meta_X = np.column_stack([
-        clf_a.predict_proba(X)[:, 1],
-        clf_b.predict_proba(X)[:, 1],
-    ])
-    return meta.predict(meta_X)
-
-# compat alias
-stacking_predict = stacked_predict
 
 
 # ---------------------------------------------------------------------------
@@ -530,22 +367,82 @@ compute_train_test_domain_similarity = domain_overlap
 # SECTION 8 — 4-way MCQ accuracy
 # ---------------------------------------------------------------------------
 
-def mcq_accuracy(clf, ohe_vec, df: pd.DataFrame, n_rows: Optional[int] = None) -> float:
+def _build_hc_row(article, question, opt_text, tfidf_vec, idf_dict=None, vocab=None):
+    """Compute the 12 handcrafted features for one (article, question, option) triple."""
+    if tfidf_vec is not None and len(opt_text) > 0:
+        art_vec = tfidf_vec.transform([article])
+        q_vec = tfidf_vec.transform([question])
+        opt_vec = tfidf_vec.transform([opt_text])
+        sim_ao = float(_sk_cos(art_vec, opt_vec)[0, 0])
+        sim_qo = float(_sk_cos(q_vec, opt_vec)[0, 0])
+        opt_tfidf_max = float(opt_vec.max())
+    else:
+        sim_ao = sim_qo = 0.0
+        opt_tfidf_max = 0.0
+
+    art_tokens = set(article.split())
+    opt_tokens = set(opt_text.split())
+    q_tokens = set(question.split())
+    overlap_ao = len(opt_tokens & art_tokens) / (len(opt_tokens) + 1e-9)
+    overlap_qo = len(opt_tokens & q_tokens) / (len(opt_tokens) + 1e-9)
+    opt_len_ratio = min(len(opt_text) / 200.0, 1.0)
+    overlap_oa = len(opt_tokens & art_tokens) / (len(art_tokens) + 1e-9)
+    overlap_oq = len(opt_tokens & q_tokens) / (len(q_tokens) + 1e-9)
+
+    opt_idf_mean = 0.0
+    if idf_dict and vocab and opt_tokens:
+        idfs = [idf_dict.get(w, 0.0) for w in opt_tokens if w in vocab]
+        opt_idf_mean = sum(idfs) / len(idfs) if idfs else 0.0
+
+    has_digit = 1.0 if re.search(r"\d", opt_text) else 0.0
+
+    art_bigrams = set(
+        " ".join(article.split()[i:i+2])
+        for i in range(len(article.split()) - 1)
+    )
+    opt_bigrams = set(
+        " ".join(opt_text.split()[i:i+2])
+        for i in range(len(opt_text.split()) - 1)
+    )
+    shared_bigrams = len(art_bigrams & opt_bigrams) / (len(opt_bigrams) + 1e-9) if opt_bigrams else 0.0
+
+    starts_cap = 1.0 if opt_text and opt_text[0].isupper() else 0.0
+
+    return [sim_ao, sim_qo, overlap_ao, overlap_qo, opt_len_ratio,
+            overlap_oa, overlap_oq, opt_idf_mean, has_digit,
+            shared_bigrams, opt_tfidf_max, starts_cap]
+
+
+def mcq_accuracy(clf, ohe_vec, df: pd.DataFrame, n_rows: Optional[int] = None, tfidf_vec=None) -> float:
     """
     For each row score all four options; pick the one with highest P(correct).
     Returns fraction of rows where the predicted option matches the gold label.
+    Uses handcrafted features when tfidf_vec is provided.
     """
     if n_rows and len(df) > n_rows:
         df = df.sample(n_rows, random_state=_RNG_SEED)
     hits = total = 0
+    use_hc = tfidf_vec is not None
+    idf_dict = dict(zip(tfidf_vec.get_feature_names_out(), tfidf_vec.idf_)) if use_hc else None
+    vocab = set(tfidf_vec.get_feature_names_out()) if use_hc else None
     for _, row in df.iterrows():
-        encoded = [
-            make_sample_string(row["article"], row["question"], str(row[o]))
-            for o in _CHOICES
-        ]
-        X     = ohe_vec.transform(encoded)
+        article = clean_text(row["article"])
+        question = clean_text(row["question"])
+        encoded = []
+        hc_rows = []
+        for o in _CHOICES:
+            opt_text = clean_text(str(row[o]))
+            encoded.append(make_sample_string(article, question, opt_text))
+            if use_hc:
+                hc_rows.append(
+                    _build_hc_row(article, question, opt_text, tfidf_vec, idf_dict, vocab)
+                )
+        X = ohe_vec.transform(encoded)
+        if use_hc and hc_rows:
+            hc = np.array(hc_rows, dtype=np.float32)
+            X = _stack_hc(X, hc)
         probs = clf.predict_proba(X)[:, 1]
-        best  = _CHOICES[int(np.argmax(probs))]
+        best = _CHOICES[int(np.argmax(probs))]
         if best == str(row["answer"]).strip().upper():
             hits += 1
         total += 1
@@ -965,24 +862,11 @@ compute_generation_metrics = generation_metrics
 # SECTION 12 — Persistence
 # ---------------------------------------------------------------------------
 
-def persist_models(lr, svm, km, lp, meta, metrics: dict):
+def persist_models(nn_model, metrics: dict):
     """Write all Model-A artifacts to _MODEL_DEST."""
-    artifacts = [
-        ("logistic_regression.pkl", lr),
-        ("svm.pkl",                 svm),
-        ("kmeans.pkl",              km),
-        ("label_propagation.pkl",   lp),
-        ("stacking_meta.pkl",       meta),
-        ("metrics.pkl",             metrics),
-    ]
-    for fname, obj in tqdm(
-        [(f, o) for f, o in artifacts if o is not None],
-        desc="saving artifacts", unit="file",
-    ):
-        joblib.dump(obj, os.path.join(_MODEL_DEST, fname))
+    save_checkpoint(nn_model, os.path.join(_MODEL_DEST, "answer_verifier.pt"))
+    joblib.dump(metrics, os.path.join(_MODEL_DEST, "metrics.pkl"))
     print(f"\n  artifacts → {_MODEL_DEST}")
-    
-    # Export metrics to CSV
     _export_metrics_to_csv(metrics)
 
 
@@ -990,42 +874,26 @@ def _export_metrics_to_csv(metrics: dict):
     """Export all metrics to CSV files in the reports directory."""
     import os
     os.makedirs(_REPORTS_DEST, exist_ok=True)
-    
-    # 1. Binary classification metrics (LR and SVM)
-    binary_data = []
-    for model_name in ["lr", "svm"]:
-        if model_name in metrics and metrics[model_name]:
-            row = {"model": model_name.upper()}
-            row.update({k: v for k, v in metrics[model_name].items() if k != "predictions"})
-            binary_data.append(row)
-    
-    if binary_data:
-        df_binary = pd.DataFrame(binary_data)
+
+    # 1. NN binary classification metrics
+    if "nn" in metrics and metrics["nn"]:
+        nn_data = [{"model": "NN"}]
+        nn_data[0].update(
+            {k: v for k, v in metrics["nn"].items() if k != "predictions"}
+        )
+        df_nn = pd.DataFrame(nn_data)
         csv_path = os.path.join(_REPORTS_DEST, "model_a_binary_metrics.csv")
-        df_binary.to_csv(csv_path, index=False)
+        df_nn.to_csv(csv_path, index=False)
         print(f"    → {csv_path}")
-    
-    # 2. Ensemble metrics
-    if "ensemble" in metrics and metrics["ensemble"]:
-        ensemble_data = []
-        for strategy, vals in metrics["ensemble"].items():
-            row = {"strategy": strategy}
-            row.update(vals)
-            ensemble_data.append(row)
-        
-        df_ensemble = pd.DataFrame(ensemble_data)
-        csv_path = os.path.join(_REPORTS_DEST, "model_a_ensemble_metrics.csv")
-        df_ensemble.to_csv(csv_path, index=False)
-        print(f"    → {csv_path}")
-    
-    # 3. Cosine retrieval metrics
+
+    # 2. Cosine retrieval metrics
     if "cosine_retrieval" in metrics and metrics["cosine_retrieval"]:
         df_cosine = pd.DataFrame([metrics["cosine_retrieval"]])
         csv_path = os.path.join(_REPORTS_DEST, "model_a_cosine_retrieval_metrics.csv")
         df_cosine.to_csv(csv_path, index=False)
         print(f"    → {csv_path}")
-    
-    # 4. Text generation metrics
+
+    # 3. Text generation metrics
     if "text_generation" in metrics and metrics["text_generation"]:
         df_gen = pd.DataFrame([metrics["text_generation"]])
         csv_path = os.path.join(_REPORTS_DEST, "model_a_text_generation_metrics.csv")
@@ -1045,20 +913,39 @@ def _load_artifact(fname: str):
 # SECTION 13 — Main training pipeline
 # ---------------------------------------------------------------------------
 
+def _train_transformer_av(train_csv, val_csv):
+    """Optional transformer answer verifier training if transformers is installed."""
+    try:
+        from src.transformer_train import train_answer_verifier_transformer
+    except ImportError:
+        print("  transformers not installed — skipping")
+        return
+    if not os.path.exists(train_csv):
+        print(f"  {train_csv} not found — skipping transformer AV")
+        return
+    train_df = pd.read_csv(train_csv)
+    val_df = pd.read_csv(val_csv) if os.path.exists(val_csv) else None
+    try:
+        train_answer_verifier_transformer(train_df, val_df, epochs=5, use_lora=True)
+    except Exception as e:
+        print(f"  transformer AV failed: {e}")
+
+
 def train_all():
     """
-    End-to-end Model-A pipeline:
+    End-to-end Model-A pipeline (neural network + transformer):
       1  Load OHE feature arrays
-      2  Fit LR, SVM, K-Means, Label Propagation
-      3  Build soft / hard / stacking ensembles
+      2  Train NN answer verifier
+      3  Optional: K-Means / Label Propagation analysis
       4  Evaluate on validation: binary metrics, 4-way MCQ, cosine accuracy
       5  Generate MCQs and score BLEU / ROUGE / METEOR
-      6  Final evaluation on held-out test split
-      7  Persist all artifacts
+      6  Train transformer answer verifier (optional)
+      7  Final evaluation on held-out test split
+      8  Persist all artifacts
     """
     BAR = "─" * 58
     print(BAR)
-    print("  verifier_a  ::  training run")
+    print("  verifier_a  ::  neural network training run")
     print(BAR)
 
     # -- 1. Load arrays --
@@ -1069,60 +956,23 @@ def train_all():
     print(f"    features={X_tr.shape[1]:,}")
     print(f"    pos-rate — train={info['train_pos_frac']:.3f}  val={info['val_pos_frac']:.3f}")
 
-    # -- 2. Base classifiers --
-    print("\n(2) fitting base classifiers")
-    classifiers = [
-        ("LR",        lambda: fit_logistic(X_tr, y_tr)),
-        ("SVM",       lambda: fit_svm(X_tr, y_tr)),
-        ("K-Means",   lambda: fit_kmeans(X_tr, k=4)),
-        ("LabelProp", lambda: fit_label_propagation(X_tr, y_tr, unlabelled_frac=0.30)),
-    ]
-    results = {}
-    for name, fn in tqdm(classifiers, desc="base classifiers", unit="model"):
-        results[name] = fn()
-    lr, svm, km, lp = results["LR"], results["SVM"], results["K-Means"], results["LabelProp"]
+    # -- 2. Train neural network answer verifier --
+    print("\n(2) training neural network answer verifier")
+    nn_model = fit_answer_verifier(X_tr, y_tr, X_va, y_va, hc_tr=hc_tr, hc_va=hc_va, epochs=30)
 
-    # -- 3. Ensembles --
-    print("\n(3) building ensemble layers")
-    meta = fit_meta_learner(lr, svm, X_va, y_va)
+    # -- 3. Validation snapshot --
+    print("\n(3) validation snapshot")
+    X_va_stacked = _stack_hc(X_va, hc_va)
+    nn_res = score_classifier(nn_model, X_va_stacked, y_va, "NN (val)")
 
-    # -- 4. Validation snapshot --
-    print("\n(4) validation snapshot")
-    lr_res  = score_classifier(lr,  X_va, y_va, "Logistic Regression (val)")
-    svm_res = score_classifier(svm, X_va, y_va, "SVM                 (val)")
+    # Data / vectorizer paths
+    ohe_path   = os.path.join(ARTIFACT_DIR, "ohe_vectorizer.pkl")
+    tfidf_path = os.path.join(ARTIFACT_DIR, "tfidf_vectorizer.pkl")
+    val_csv    = os.path.join(ARTIFACT_DIR, "val_clean.csv")
+    train_csv  = os.path.join(ARTIFACT_DIR, "train_clean.csv")
+    test_csv   = os.path.join(ARTIFACT_DIR, "test_clean.csv")
 
-    blend_configs = [
-        ("soft",    soft_blend_predict(lr, svm, X_va)),
-        ("hard",    hard_blend_predict(lr, svm, X_va)),
-        ("stacked", stacked_predict(meta, lr, svm, X_va)),
-    ]
-    blend_metrics = {}
-    for label, preds in tqdm(blend_configs, desc="ensemble eval (val)", unit="strategy"):
-        a = accuracy_score(y_va, preds)
-        f = f1_score(y_va, preds, average="macro", zero_division=0)
-        e = float(np.mean([str(p) == str(t) for p, t in zip(preds, y_va)]))
-        blend_metrics[label] = {"acc": a, "f1": f, "em": e}
-        print(f"\n  {label} blend (val)\n    acc={a:.4f}  f1={f:.4f}  em={e:.4f}")
-
-    soft_a, soft_f, soft_em = blend_metrics["soft"].values()
-    hard_a, hard_f, _       = blend_metrics["hard"].values()
-    stk_a,  stk_f,  _       = blend_metrics["stacked"].values()
-
-    # Local paths (commented)
-    # ohe_path   = os.path.join(ARTIFACT_DIR, "ohe_vectorizer.pkl")
-    # tfidf_path = os.path.join(ARTIFACT_DIR, "tfidf_vectorizer.pkl")
-    # val_csv    = os.path.join(ARTIFACT_DIR, "val_clean.csv")
-    # train_csv  = os.path.join(ARTIFACT_DIR, "train_clean.csv")
-    # test_csv   = os.path.join(ARTIFACT_DIR, "test_clean.csv")
-    
-    # Kaggle paths (active)
-    ohe_path   = "/kaggle/working/data/processed/ohe_vectorizer.pkl"
-    tfidf_path = "/kaggle/working/data/processed/tfidf_vectorizer.pkl"
-    val_csv    = "/kaggle/working/data/processed/val_clean.csv"
-    train_csv  = "/kaggle/working/data/processed/train_clean.csv"
-    test_csv   = "/kaggle/working/data/processed/test_clean.csv"
-
-    cos_metrics, lr_4w, svm_4w = {}, 0.0, 0.0
+    cos_metrics, nn_4w = {}, 0.0
     ohe_vec = tfidf_vec = None
 
     if all(os.path.exists(p) for p in [ohe_path, tfidf_path, val_csv]):
@@ -1133,11 +983,8 @@ def train_all():
         eval_df = val_df.sample(min(1_000, len(val_df)), random_state=_RNG_SEED)
 
         print("\n  4-way MCQ accuracy (val):")
-        for tag, mdl in tqdm([("LR", lr), ("SVM", svm)], desc="4-way MCQ", unit="model"):
-            acc = mcq_accuracy(mdl, ohe_vec, eval_df)
-            print(f"    {tag:4s}: {acc:.4f}")
-        lr_4w  = mcq_accuracy(lr,  ohe_vec, eval_df)
-        svm_4w = mcq_accuracy(svm, ohe_vec, eval_df)
+        nn_4w = mcq_accuracy(nn_model, ohe_vec, eval_df, tfidf_vec=tfidf_vec)
+        print(f"    NN : {nn_4w:.4f}")
 
         print("\n  cosine-similarity retrieval accuracy (val):")
         best = sweep_retrieval_params(tfidf_vec, ohe_vec, eval_df)
@@ -1155,8 +1002,8 @@ def train_all():
             print(f"\n  domain overlap (train↔test): {dom:.4f}")
             cos_metrics["domain_similarity"] = dom
 
-    # -- 5. Question generation + text metrics --
-    print("\n(5) MCQ generation checks")
+    # -- 4. Question generation + text metrics --
+    print("\n(4) MCQ generation checks")
     gen_m: dict = {}
     if os.path.exists(val_csv):
         gen_df  = pd.read_csv(val_csv)
@@ -1179,52 +1026,32 @@ def train_all():
     else:
         print("    (val_clean.csv not found — skipping generation eval)")
 
+    # -- 5. Transformer answer verifier (optional) --
+    print("\n(5) transformer answer verifier")
+    _train_transformer_av(train_csv, val_csv)
+
     # -- 6. Test evaluation --
     print("\n(6) held-out test split")
-    test_configs = [
-        ("LR  (test)",           lr,  X_te, y_te),
-        ("SVM (test)",           svm, X_te, y_te),
-    ]
-    for label, clf, X, y in tqdm(test_configs, desc="test eval", unit="model"):
-        score_classifier(clf, X, y, label)
-
-    for label, preds in tqdm([
-        ("soft",    soft_blend_predict(lr, svm, X_te)),
-        ("hard",    hard_blend_predict(lr, svm, X_te)),
-        ("stacked", stacked_predict(meta, lr, svm, X_te)),
-    ], desc="ensemble eval (test)", unit="strategy"):
-        a = accuracy_score(y_te, preds)
-        f = f1_score(y_te, preds, average="macro", zero_division=0)
-        e = float(np.mean([str(p) == str(t) for p, t in zip(preds, y_te)]))
-        print(f"\n  {label} blend (test)\n    acc={a:.4f}  f1={f:.4f}  em={e:.4f}")
-        if label == "soft":
-            soft_te_a, soft_te_f, soft_te_e = a, f, e
-        elif label == "hard":
-            hard_te_a, hard_te_f = a, f
-        elif label == "stacked":
-            stk_te_a, stk_te_f = a, f
+    X_te_stacked = _stack_hc(X_te, hc_te)
+    score_classifier(nn_model, X_te_stacked, y_te, "NN (test)")
+    preds = nn_model.predict(X_te_stacked)
+    te_a  = accuracy_score(y_te, preds)
+    te_f  = f1_score(y_te, preds, average="macro", zero_division=0)
+    te_e  = float(np.mean([str(p) == str(t) for p, t in zip(preds, y_te)]))
+    print(f"\n  NN (test)\n    acc={te_a:.4f}  f1={te_f:.4f}  em={te_e:.4f}")
 
     # -- Aggregate metrics dict --
     metrics = {
-        "lr":  {**lr_res,  "4way_acc": lr_4w},
-        "svm": {**svm_res, "4way_acc": svm_4w},
-        "ensemble": {
-            "soft":    {"val_acc": soft_a, "val_f1": soft_f, "val_em": soft_em,
-                        "test_acc": soft_te_a, "test_f1": soft_te_f, "test_em": soft_te_e},
-            "hard":    {"val_acc": hard_a, "val_f1": hard_f,
-                        "test_acc": hard_te_a, "test_f1": hard_te_f},
-            "stacked": {"val_acc": stk_a,  "val_f1": stk_f,
-                        "test_acc": stk_te_a, "test_f1": stk_te_f},
-        },
+        "nn":               {**(nn_res or {}), "4way_acc": nn_4w},
         "cosine_retrieval":  cos_metrics,
         "text_generation":   gen_m,
     }
 
-    persist_models(lr, svm, km, lp, meta, metrics)
+    persist_models(nn_model, metrics)
     print("\n" + "=" * 65)
     print("  verifier_a training complete")
     print(BAR)
-    return lr, svm, km, lp, meta, metrics
+    return nn_model, metrics
 
 
 # ---------------------------------------------------------------------------
@@ -1232,16 +1059,29 @@ def train_all():
 # ---------------------------------------------------------------------------
 
 def load_model_a() -> dict:
-    """Load all Model-A artifacts from disk. Returns dict keyed by model role."""
-    registry = {
-        "lr":      "logistic_regression.pkl",
-        "svm":     "svm.pkl",
-        "km":      "kmeans.pkl",
-        "lp":      "label_propagation.pkl",
-        "meta":    "stacking_meta.pkl",
-        "metrics": "metrics.pkl",
-    }
-    return {alias: _load_artifact(fname) for alias, fname in registry.items()}
+    """Load the NN answer verifier and metrics from disk."""
+    nn_path = os.path.join(_MODEL_DEST, "answer_verifier.pt")
+    if not os.path.exists(nn_path):
+        print(f"  WARNING: NN checkpoint not found at {nn_path}")
+        return {"model": None, "metrics": None}
+    input_dim = (  # try to infer from saved meta
+        _load_checkpoint_meta(nn_path, "input_dim") or 10_000
+    )
+    model = AnswerVerifier(input_dim=input_dim)
+    ckpt = torch.load(nn_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    metrics = _load_artifact("metrics.pkl")
+    return {"model": model, "metrics": metrics}
+
+
+def _load_checkpoint_meta(path: str, key: str):
+    """Read a single meta key from a saved NN checkpoint."""
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        return ckpt.get("meta", {}).get(key)
+    except Exception:
+        return None
 
 
 def verify_answer(
@@ -1250,33 +1090,102 @@ def verify_answer(
     option: str,
     models: dict,
     ohe_vec,
+    tfidf_vec=None,
 ) -> dict:
     """
-    Predict whether `option` is the correct answer for `question` from `article`.
-    Returns prediction, per-model probabilities, soft blend, and stacked output.
+    Predict whether `option` is the correct answer using the neural network
+    with handcrafted features. Returns prediction and probabilities.
     """
-    sample   = ohe_vec.transform([make_sample_string(article, question, option)])
-    lr_prob  = models["lr"].predict_proba(sample)[0, 1]
-    svm_prob = models["svm"].predict_proba(sample)[0, 1]
-    blend    = float((lr_prob + svm_prob) / 2.0)
+    idf_dict = dict(zip(tfidf_vec.get_feature_names_out(), tfidf_vec.idf_)) if tfidf_vec is not None else None
+    vocab = set(tfidf_vec.get_feature_names_out()) if tfidf_vec is not None else None
+    article_clean = clean_text(article)
+    question_clean = clean_text(question)
+    opt_clean = clean_text(option)
 
-    meta_mdl  = models.get("meta")
-    meta_in   = np.array([[lr_prob, svm_prob]])
-    stk_prob  = meta_mdl.predict_proba(meta_in)[0, 1] if meta_mdl else blend
+    sample = ohe_vec.transform([make_sample_string(article_clean, question_clean, opt_clean)])
+    if tfidf_vec is not None:
+        hc = np.array([_build_hc_row(article_clean, question_clean, opt_clean, tfidf_vec, idf_dict, vocab)], dtype=np.float32)
+        sample = _stack_hc(sample, hc)
+
+    nn_prob = float(models["model"].predict_proba(sample)[0, 1])
 
     return {
-        "prediction":     int(stk_prob > 0.5),
-        "probability":    float(stk_prob),
-        "lr_proba":       float(lr_prob),
-        "svm_proba":      float(svm_prob),
-        "soft_ensemble":  blend,
-        "stack_ensemble": float(stk_prob),
+        "prediction":     int(nn_prob > 0.5),
+        "probability":    nn_prob,
+        "lr_proba":       nn_prob,
+        "svm_proba":      nn_prob,
+        "soft_ensemble":  nn_prob,
+        "stack_ensemble": nn_prob,
+        "nn_proba":       nn_prob,
     }
 
 
 def generate_mcq(article: str, n_questions: int = 5) -> List[dict]:
     """Public API: generate n_questions MCQs from a passage."""
     return compose_questions(str(article), count=n_questions)
+
+
+# ---------------------------------------------------------------------------
+# Optional: transformer-based model loading (only if transformers is installed)
+# ---------------------------------------------------------------------------
+
+def _try_import_transformers():
+    try:
+        import transformers as _tf
+        import peft as _peft
+        return True
+    except ImportError:
+        return False
+
+
+def load_transformer_answer_verifier():
+    """Load a trained TransformerAnswerVerifier checkpoint + tokenizer."""
+    if not _try_import_transformers():
+        print("  transformers/peft not installed. Skipping transformer model.")
+        return None, None
+
+    from transformers import AutoTokenizer
+    from src.nn_models import TransformerAnswerVerifier
+
+    meta_path = os.path.join(_MODEL_DEST.replace("neural", "transformer"), "transformer_meta.json")
+    ckpt_path = os.path.join(_MODEL_DEST.replace("neural", "transformer"), "answer_verifier_transformer.pt")
+
+    if not os.path.exists(ckpt_path):
+        return None, None
+
+    with open(meta_path) as f:
+        import json
+        meta = json.load(f)
+
+    model_name = meta.get("model_name", "bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    model = TransformerAnswerVerifier(model_name=model_name, num_labels=2)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    model.eval()
+    print(f"  loaded transformer answer verifier ({model_name})")
+    return model, tokenizer
+
+
+def verify_answer_transformer(
+    article: str,
+    question: str,
+    option: str,
+    model,
+    tokenizer,
+) -> dict:
+    """Predict P(correct) using the transformer answer verifier."""
+    text = f"article: {article}\nquestion: {question}\noption: {option}"
+    enc = tokenizer(text, truncation=True, padding="max_length", max_length=384, return_tensors="pt")
+    with torch.no_grad():
+        out = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+        probs = torch.softmax(out.logits, dim=-1)
+        prob_correct = float(probs[0, 1])
+    return {
+        "prediction": int(prob_correct > 0.5),
+        "probability": prob_correct,
+        "nn_proba": prob_correct,
+    }
 
 
 # ---------------------------------------------------------------------------

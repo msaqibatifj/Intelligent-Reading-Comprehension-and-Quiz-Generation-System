@@ -1,0 +1,33 @@
+{
+  "project": "Intelligent-Reading-Comprehension-and-Quiz-Generation-System",
+  "session_summary": "Debugged training hang in Transformer AnswerVerifier (bert-base-uncased). The model loaded successfully but training appeared stuck after the LOAD REPORT and parameter count printout.",
+  "files_modified": [
+    {
+      "path": "race_rc_project/src/nn_models.py",
+      "class": "TextDataset",
+      "change": "Moved tokenization from __getitem__ (on-the-fly, one sample at a time) to __init__ (batched, single call). Removed per-sample tokenizer calls with padding='max_length'=384.",
+      "rationale": "On-the-fly tokenization with num_workers=0 caused sequential per-sample tokenization of 384 tokens for 948,716 training samples — extremely slow before the first batch appeared. Batched tokenization is much faster and __getitem__ now just indexes pre-computed tensors."
+    }
+  ],
+  "root_cause": {
+    "symptom": "Training hung after 'BertForSequenceClassification LOAD REPORT' and 'trainable params: 294,912 || all params: 109,778,690 || trainable%: 0.2686'",
+    "cause": "TextDataset.__getitem__ called tokenizer individually for each sample with padding='max_length'=384. With num_workers=0 in DataLoader, the first batch required 16 sequential tokenizations of 384-token sequences before any tqdm output appeared.",
+    "fix": "Pre-tokenize all texts in __init__ tokenizer(texts, ...) which uses HuggingFace's fast batched Rust tokenizer. __getitem__ now returns pre-computed tensors via indexing."
+  },
+  "architecture_notes": {
+    "model": "bert-base-uncased with LoRA (rank 8, 0.27% trainable params)",
+    "data": "279,035 rows (train=237,179 val=41,856) → 948,716 training examples after prepare_answer_verifier_data (4 per MCQ row)",
+    "training_config": "epochs=5, batch_size=16, lr=2e-5, max_length=384, patience=2, AdamW + CosineAnnealingLR + AMP",
+    "files": {
+      "race_rc_project/src/nn_models.py": "TransformerAnswerVerifier, TextDataset, train_transformer(), QuestionGenerator",
+      "race_rc_project/src/transformer_train.py": "train_answer_verifier_transformer(), train_question_generator(), prepare_answer_verifier_data()",
+      "race_rc_project/src/model_b_train.py": "alternative training script",
+      "race_rc_project/src/model_a_train.py": "alternative training script"
+    }
+  },
+  "misc_tips": [
+    "Suppress HF logging noise with: transformers.logging.set_verbosity_error() before training",
+    "UNEXPECTED keys in LOAD REPORT (cls.predictions.*, cls.seq_relationship.*) are from BERT pre-training head — safe to ignore when loading for classification",
+    "MISSING keys (classifier.weight, classifier.bias) are the newly initialized classification head — expected"
+  ]
+}

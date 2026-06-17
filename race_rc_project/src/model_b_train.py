@@ -10,10 +10,18 @@ from typing import List, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
+
+from src.nn_models import (
+    DistractorScorer,
+    HintScorer,
+    DEVICE,
+    load_checkpoint,
+    save_checkpoint,
+    train_nn,
+)
 
 # from preprocessing import (
 #     ARTIFACT_DIR,
@@ -31,16 +39,27 @@ from tqdm import tqdm
 # ARTIFACT_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "data", "processed"))
 # _SCORER_OUT = os.path.normpath(os.path.join(_THIS_DIR, "..", "models", "model_b", "traditional"))
 
-# Kaggle paths (active)
-_THIS_DIR = "/kaggle/working/src"
-ARTIFACT_DIR = "/kaggle/working/data/processed"
-_SCORER_OUT = "/kaggle/working/models/model_b/traditional"
+# Local paths
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_PROJ  = os.path.normpath(os.path.join(_THIS_DIR, ".."))
+except NameError:
+    BASE_PROJ = os.getcwd()
+ARTIFACT_DIR = os.path.join(BASE_PROJ, "data", "processed")
+_SCORER_OUT = os.path.join(BASE_PROJ, "models", "model_b", "neural")
 
 sys.path.insert(0, _THIS_DIR)
 os.makedirs(_SCORER_OUT, exist_ok=True)
 
-with open(os.path.join(ARTIFACT_DIR, "tfidf_vectorizer.pkl"), "rb") as _f:
-    _TFIDF = pickle.load(_f)
+# Import text utilities from model_a_train (which defines stubs)
+from src.model_a_train import word_tokens, sentence_fragments, normalize
+
+_TFIDF_PATH = os.path.join(ARTIFACT_DIR, "tfidf_vectorizer.pkl")
+try:
+    with open(_TFIDF_PATH, "rb") as _f:
+        _TFIDF = pickle.load(_f)
+except (FileNotFoundError, EOFError):
+    _TFIDF = None
 
 # ---------------------------------------------------------------------------
 # Similarity helpers
@@ -161,11 +180,30 @@ def _build_hint_rows(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 # Training & evaluation
 # ---------------------------------------------------------------------------
 
-def _fit(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
-    clf = LogisticRegression(max_iter=1_500, C=2.0, class_weight="balanced")
-    return clf.fit(X, y)
+def _fit_scorer(model_class, input_dim, X, y, **kw):
+    """Train a small NN on handcrafted features."""
+    pos = y.sum()
+    neg = len(y) - pos
+    pos_weight = neg / max(pos, 1)
+    model = model_class(input_dim=input_dim)
+    model = train_nn(
+        model, X, y,
+        epochs=kw.get("epochs", 20),
+        batch_size=kw.get("batch_size", 256),
+        lr=kw.get("lr", 1e-3),
+        pos_weight=pos_weight,
+        patience=kw.get("patience", 5),
+        verbose=True,
+    )
+    return model
 
-fit_distractor_scorer = fit_hint_scorer = _fit   # same hyperparams for both
+
+_fit_distractor = lambda X, y: _fit_scorer(DistractorScorer, X.shape[1], X, y)
+_fit_hint       = lambda X, y: _fit_scorer(HintScorer,       X.shape[1], X, y)
+
+fit_distractor_scorer = _fit_distractor
+fit_hint_scorer       = _fit_hint
+
 
 def _eval(clf, X, y) -> dict:
     p = clf.predict(X)
@@ -228,9 +266,8 @@ def run():
     # train_df = pd.read_csv("../data/processed/train_clean.csv")
     # val_df   = pd.read_csv("../data/processed/val_clean.csv")
     
-    # Kaggle paths (active)
-    train_df = pd.read_csv("/kaggle/working/data/processed/train_clean.csv")
-    val_df   = pd.read_csv("/kaggle/working/data/processed/val_clean.csv")
+    train_df = pd.read_csv(os.path.join(ARTIFACT_DIR, "train_clean.csv"))
+    val_df   = pd.read_csv(os.path.join(ARTIFACT_DIR, "val_clean.csv"))
     print(f"train: {len(train_df):,}  |  val: {len(val_df):,}")
 
     print("\n--- distractor ---")
@@ -242,8 +279,8 @@ def run():
     print(f"  matrix {X_h.shape}  positives: {y_h.sum():,}")
 
     print("\n--- fit ---")
-    dist_clf = _fit(X_d, y_d)
-    hint_clf = _fit(X_h, y_h)
+    dist_clf = _fit_distractor(X_d, y_d)
+    hint_clf = _fit_hint(X_h, y_h)
 
     # eval with metrics collection
     metrics_rows = []
@@ -262,12 +299,16 @@ def run():
             })
             print(f"  [{name} {split}]  " + "  ".join(f"{k}={v:.4f}" for k, v in m.items()))
 
-    joblib.dump(dist_clf, os.path.join(_SCORER_OUT, "distractor.pkl"))
-    joblib.dump(hint_clf, os.path.join(_SCORER_OUT, "hint.pkl"))
-    
+    save_checkpoint(dist_clf, os.path.join(_SCORER_OUT, "distractor.pt"))
+    save_checkpoint(hint_clf,  os.path.join(_SCORER_OUT, "hint.pt"))
+
     # Export metrics to CSV
     _export_metrics_to_csv(metrics_rows)
-    
+
+    # Train transformer question generator + distractor generator
+    print("\n--- transformer models ---")
+    _train_transformer_qg_dg(train_df)
+
     print(f"\n[scorer_b] done — saved to {_SCORER_OUT}\n{SEP}")
 
 
@@ -277,14 +318,32 @@ def _export_metrics_to_csv(metrics_rows: list):
     # Local path (commented)
     # reports_dir = os.path.normpath(os.path.join(_THIS_DIR, "..", "data", "processed", "reports"))
     
-    # Kaggle path (active)
-    reports_dir = "/kaggle/working/data/processed/reports"
+    reports_dir = os.path.join(ARTIFACT_DIR, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     
     df = pd.DataFrame(metrics_rows)
     csv_path = os.path.join(reports_dir, "model_b_metrics.csv")
     df.to_csv(csv_path, index=False)
     print(f"    → {csv_path}")
+
+
+def _train_transformer_qg_dg(train_df):
+    """Optional transformer QG + DG training if transformers is installed."""
+    try:
+        from src.transformer_train import train_question_generator, train_distractor_generator
+    except ImportError:
+        print("  transformers not installed — skipping")
+        return
+    try:
+        print("  training question generator (FLAN-T5) …")
+        train_question_generator(train_df, epochs=10, use_lora=True)
+    except Exception as e:
+        print(f"  QG failed: {e}")
+    try:
+        print("  training distractor generator (BART) …")
+        train_distractor_generator(train_df, epochs=10, use_lora=True)
+    except Exception as e:
+        print(f"  DG failed: {e}")
 
 
 if __name__ == "__main__":

@@ -11,18 +11,28 @@ Public functions:
 import os
 import sys
 import pickle
+import re
 import time
 import random
 
 import joblib
+import numpy as np
 import pandas as pd
+import torch
+from sklearn.metrics.pairwise import cosine_similarity as _sk_cos
+from scipy.sparse import hstack as sparse_hstack
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+except NameError:
+    PROJECT_ROOT = os.getcwd()
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.preprocessing import clean_text, tokenize, split_into_sentences, PROCESSED_DIR, BASE_DIR
-from src.model_a_train import generate_questions_from_passage, verify_answer as verify_answer_ma
+from src.preprocessing import clean_text, tokenize, split_into_sentences, tfidf_cosine, PROCESSED_DIR, BASE_DIR
+from src.model_a_train import generate_questions_from_passage, make_sample_string, verify_answer as verify_answer_ma
+from src.nn_models import load_checkpoint, AnswerVerifier, DistractorScorer, HintScorer, TransformerAnswerVerifier
 
 try:
     from model_b_train import generate_distractors, generate_hints
@@ -36,8 +46,10 @@ except Exception:
             return ["Read carefully", "Focus keywords", "Check passage"]
         return [f"Hint {i+1}: {s[:100]} …" for i, s in enumerate(sents[:n])]
 
-MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'traditional')
-MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'traditional')
+MODEL_A_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'neural')
+MODEL_A_TRANSFORMER_DIR = os.path.join(BASE_DIR, 'models', 'model_a', 'transformer')
+MODEL_B_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'neural')
+MODEL_B_TRANSFORMER_DIR = os.path.join(BASE_DIR, 'models', 'model_b', 'transformer')
 
 MIN_QUIZ_QUESTIONS = 5
 MAX_QUIZ_QUESTIONS = 10
@@ -46,22 +58,121 @@ MAX_QUIZ_QUESTIONS = 10
 _cache = {}
 
 
+def _try_load_transformers(cache):
+    """Load transformer models if available."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return
+
+    # Transformer answer verifier
+    meta_path = os.path.join(MODEL_A_TRANSFORMER_DIR, 'transformer_meta.json')
+    ckpt_path = os.path.join(MODEL_A_TRANSFORMER_DIR, 'answer_verifier_transformer.pt')
+    if os.path.exists(ckpt_path) and os.path.exists(meta_path):
+        try:
+            import json
+            with open(meta_path) as f:
+                meta = json.load(f)
+            tokenizer = AutoTokenizer.from_pretrained(meta.get('model_name', 'bert-base-uncased'))
+            model = TransformerAnswerVerifier(model_name=meta['model_name'], num_labels=2)
+            model.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True))
+            model.eval()
+            cache['transformer_model'] = model
+            cache['transformer_tokenizer'] = tokenizer
+            print(f"  loaded transformer answer verifier ({meta['model_name']})")
+        except Exception as e:
+            print(f"  WARNING: transformer model load failed: {e}")
+
+    # Question generator
+    qg_path = os.path.join(MODEL_B_TRANSFORMER_DIR, 'question_generator.pt')
+    qg_meta_path = os.path.join(MODEL_B_TRANSFORMER_DIR, 'qg_meta.json')
+    if os.path.exists(qg_path) and os.path.exists(qg_meta_path):
+        try:
+            import json
+            with open(qg_meta_path) as f:
+                meta = json.load(f)
+            from src.nn_models import QuestionGenerator
+            cache['question_generator'] = QuestionGenerator(
+                model_name=meta['model_name'], use_lora=False
+            )
+            cache['question_generator'].load_state_dict(
+                torch.load(qg_path, map_location='cpu', weights_only=True)
+            )
+            cache['question_generator'].eval()
+            print(f"  loaded question generator ({meta['model_name']})")
+        except Exception as e:
+            print(f"  WARNING: question generator load failed: {e}")
+
+    # Distractor generator
+    dg_path = os.path.join(MODEL_B_TRANSFORMER_DIR, 'distractor_generator.pt')
+    dg_meta_path = os.path.join(MODEL_B_TRANSFORMER_DIR, 'dg_meta.json')
+    if os.path.exists(dg_path) and os.path.exists(dg_meta_path):
+        try:
+            import json
+            with open(dg_meta_path) as f:
+                meta = json.load(f)
+            from src.nn_models import DistractorGenerator
+            cache['distractor_generator'] = DistractorGenerator(
+                model_name=meta['model_name'], use_lora=False
+            )
+            cache['distractor_generator'].load_state_dict(
+                torch.load(dg_path, map_location='cpu', weights_only=True)
+            )
+            cache['distractor_generator'].eval()
+            print(f"  loaded distractor generator ({meta['model_name']})")
+        except Exception as e:
+            print(f"  WARNING: distractor generator load failed: {e}")
+
+
 def load_models():
     """Load all trained models from disk on first call; return cache thereafter."""
     if _cache:
         return _cache
 
-    def safe_load(path, label):
-        if os.path.exists(path):
-            return joblib.load(path)
-        print(f"  WARNING: {label} not found at {path}.")
-        return None
+    # Load NN answer verifier
+    nn_path = os.path.join(MODEL_A_DIR, 'answer_verifier.pt')
+    if os.path.exists(nn_path):
+        try:
+            ckpt = torch.load(nn_path, map_location='cpu', weights_only=True)
+            meta = ckpt.get('meta', {})
+            input_dim = meta.get('input_dim', 10000)
+            model = AnswerVerifier(input_dim=input_dim)
+            model.load_state_dict(ckpt['model_state_dict'])
+            model.eval()
+            _cache['model'] = model
+        except Exception as e:
+            print(f"  WARNING: could not load NN model: {e}")
+            _cache['model'] = None
+    else:
+        print(f"  WARNING: NN checkpoint not found at {nn_path}.")
+        _cache['model'] = None
 
-    _cache['lr']  = safe_load(os.path.join(MODEL_A_DIR, 'logistic_regression.pkl'), 'LR')
-    _cache['svm'] = safe_load(os.path.join(MODEL_A_DIR, 'svm.pkl'),                 'SVM')
-    _cache['meta'] = safe_load(os.path.join(MODEL_A_DIR, 'stacking_meta.pkl'),      'StackMeta')
-    _cache['dist_ranker'] = safe_load(os.path.join(MODEL_B_DIR, 'distractor.pkl'),  'Distractor')
-    _cache['hint_scorer'] = safe_load(os.path.join(MODEL_B_DIR, 'hint.pkl'),       'Hint')
+    # Load NN distractor scorer
+    dist_path = os.path.join(MODEL_B_DIR, 'distractor.pt')
+    if os.path.exists(dist_path):
+        try:
+            _cache['dist_ranker'] = load_checkpoint(DistractorScorer, dist_path)
+        except Exception as e:
+            print(f"  WARNING: could not load distractor model: {e}")
+            _cache['dist_ranker'] = None
+    else:
+        print(f"  WARNING: distractor checkpoint not found at {dist_path}.")
+        _cache['dist_ranker'] = None
+
+    # Load NN hint scorer
+    hint_path = os.path.join(MODEL_B_DIR, 'hint.pt')
+    if os.path.exists(hint_path):
+        try:
+            _cache['hint_scorer'] = load_checkpoint(HintScorer, hint_path)
+        except Exception as e:
+            print(f"  WARNING: could not load hint model: {e}")
+            _cache['hint_scorer'] = None
+    else:
+        print(f"  WARNING: hint checkpoint not found at {hint_path}.")
+        _cache['hint_scorer'] = None
+
+    # Try loading transformer models
+    _try_load_transformers(_cache)
 
     def _try_pickle(path, label):
         try:
@@ -112,6 +223,83 @@ def _get_hints(article, question, models):
     return [f"Hint {i+1}: {s[:100]} …" for i, s in enumerate(sents[:3])]
 
 
+# ---------------------------------------------------------------------------
+# Handcrafted features + ensemble prediction
+# ---------------------------------------------------------------------------
+
+ENSEMBLE_WEIGHTS = {
+    "nn": 0.35,
+    "transformer": 0.50,
+    "tfidf": 0.15,
+}
+
+
+def _compute_hc_row(article, question, opt_text, tfidf_vec, idf_dict=None, vocab=None):
+    """Compute 12 handcrafted features for one option (mirrors preprocessing.py)."""
+    if tfidf_vec is not None and len(opt_text) > 0:
+        art_vec = tfidf_vec.transform([article])
+        q_vec = tfidf_vec.transform([question])
+        opt_vec = tfidf_vec.transform([opt_text])
+        sim_ao = float(_sk_cos(art_vec, opt_vec)[0, 0])
+        sim_qo = float(_sk_cos(q_vec, opt_vec)[0, 0])
+        opt_tfidf_max = float(opt_vec.max())
+    else:
+        sim_ao = sim_qo = 0.0
+        opt_tfidf_max = 0.0
+
+    art_tokens = set(article.split())
+    opt_tokens = set(opt_text.split())
+    q_tokens = set(question.split())
+    overlap_ao = len(opt_tokens & art_tokens) / (len(opt_tokens) + 1e-9)
+    overlap_qo = len(opt_tokens & q_tokens) / (len(opt_tokens) + 1e-9)
+    opt_len_ratio = min(len(opt_text) / 200.0, 1.0)
+    overlap_oa = len(opt_tokens & art_tokens) / (len(art_tokens) + 1e-9)
+    overlap_oq = len(opt_tokens & q_tokens) / (len(q_tokens) + 1e-9)
+
+    opt_idf_mean = 0.0
+    if idf_dict and vocab and opt_tokens:
+        idfs = [idf_dict.get(w, 0.0) for w in opt_tokens if w in vocab]
+        opt_idf_mean = sum(idfs) / len(idfs) if idfs else 0.0
+
+    has_digit = 1.0 if re.search(r"\d", opt_text) else 0.0
+    art_bigrams = set(" ".join(article.split()[i:i+2]) for i in range(len(article.split()) - 1))
+    opt_bigrams = set(" ".join(opt_text.split()[i:i+2]) for i in range(len(opt_text.split()) - 1))
+    shared_bigrams = len(art_bigrams & opt_bigrams) / (len(opt_bigrams) + 1e-9) if opt_bigrams else 0.0
+    starts_cap = 1.0 if opt_text and opt_text[0].isupper() else 0.0
+
+    return [sim_ao, sim_qo, overlap_ao, overlap_qo, opt_len_ratio,
+            overlap_oa, overlap_oq, opt_idf_mean, has_digit,
+            shared_bigrams, opt_tfidf_max, starts_cap]
+
+
+def _nn_predict_proba(article, question, option_texts, nn_model, ohe_vec, tfidf_vec):
+    """P(correct) for each option from the NN with handcrafted features."""
+    idf_dict = dict(zip(tfidf_vec.get_feature_names_out(), tfidf_vec.idf_)) if tfidf_vec is not None else None
+    vocab = set(tfidf_vec.get_feature_names_out()) if tfidf_vec is not None else None
+    samples = ohe_vec.transform([make_sample_string(article, question, t) for t in option_texts])
+    if tfidf_vec is not None:
+        hc = np.array([_compute_hc_row(article, question, t, tfidf_vec, idf_dict, vocab) for t in option_texts], dtype=np.float32)
+        samples = sparse_hstack([samples, hc.astype(np.float32)], format="csr")
+    return nn_model.predict_proba(samples)[:, 1]
+
+
+def _transformer_predict_proba(article, question, option_texts, trf_model, tokenizer):
+    """P(correct) for each option from the transformer."""
+    from src.model_a_train import verify_answer_transformer
+    probs = []
+    for t in option_texts:
+        out = verify_answer_transformer(article, question, t, trf_model, tokenizer)
+        probs.append(out["probability"])
+    return np.array(probs)
+
+
+def _tfidf_scores(article, question, option_texts, tfidf_vec):
+    """Normalized TF-IDF cosine similarity scores for each option."""
+    scores = np.array([tfidf_cosine(article, t, tfidf_vec) for t in option_texts])
+    total = scores.sum() + 1e-9
+    return scores / total
+
+
 def _build_fallback_distractors(article, correct_answer, n=3):
     ans_set = set(tokenize(correct_answer))
     pool = list(dict.fromkeys([
@@ -123,11 +311,8 @@ def _build_fallback_distractors(article, correct_answer, n=3):
 
 
 def _model_a_pack(models):
-    return {
-        'lr':   models.get('lr'),
-        'svm':  models.get('svm'),
-        'meta': models.get('meta'),
-    }
+    """Return a dict that verify_answer_ma (the NN-based one) expects."""
+    return {'model': models.get('model')}
 
 
 def _build_fallback_question(article, idx, models):
@@ -233,35 +418,58 @@ def verify_answer(article, question, chosen_option_text, correct_answer_text):
     models = load_models()
     is_correct = clean_text(chosen_option_text) == clean_text(correct_answer_text)
 
-    pack = _model_a_pack(models)
-    if pack['lr'] and pack['svm'] and models.get('ohe'):
+    def _norm_prob(p_chosen, p_correct):
+        return p_chosen / (p_chosen + p_correct + 1e-9)
+
+    # --- Ensemble: combine NN + transformer + TF-IDF ---
+    option_texts = [chosen_option_text, correct_answer_text]
+    weights = {}
+    probs = {}
+
+    # NN
+    if models.get('model') and models.get('ohe') and models.get('tfidf'):
         try:
-            out = verify_answer_ma(
-                article, question, chosen_option_text, pack, models['ohe']
+            p = _nn_predict_proba(
+                clean_text(article), clean_text(question), option_texts,
+                models['model'], models['ohe'], models['tfidf'],
             )
-            conf = float(out['probability'])
-            return {
-                'is_correct': is_correct,
-                'confidence': conf if is_correct else (1.0 - conf),
-                'method': 'stacking ensemble + direct match',
-            }
+            probs['nn'] = p
+            weights['nn'] = ENSEMBLE_WEIGHTS['nn']
         except Exception:
             pass
 
+    # Transformer
+    if models.get('transformer_model') and models.get('transformer_tokenizer'):
+        try:
+            p = _transformer_predict_proba(
+                article, question, option_texts,
+                models['transformer_model'], models['transformer_tokenizer'],
+            )
+            probs['transformer'] = p
+            weights['transformer'] = ENSEMBLE_WEIGHTS['transformer']
+        except Exception:
+            pass
+
+    # TF-IDF
     if models.get('tfidf'):
         try:
-            from src.preprocessing import tfidf_cosine
-            cos_chosen = tfidf_cosine(article, chosen_option_text, models['tfidf'])
-            cos_correct = tfidf_cosine(article, correct_answer_text, models['tfidf'])
-            conf = cos_chosen / (cos_chosen + cos_correct + 1e-9)
-            return {
-                'is_correct': is_correct,
-                'confidence': conf if is_correct else (1.0 - conf),
-                'method': 'tfidf cosine similarity',
-            }
+            probs['tfidf'] = _tfidf_scores(article, question, option_texts, models['tfidf'])
+            weights['tfidf'] = ENSEMBLE_WEIGHTS['tfidf']
         except Exception:
             pass
 
+    if weights:
+        total_w = sum(weights.values())
+        p_ens = sum(weights[k] * probs[k] for k in weights) / total_w
+        conf = p_ens[0]  # P(correct) for chosen_text
+        method = "ensemble (" + "+".join(weights.keys()) + ")"
+        return {
+            'is_correct': is_correct,
+            'confidence': conf if is_correct else (1.0 - conf),
+            'method': method,
+        }
+
+    # --- Fallback: direct text match ---
     return {
         'is_correct': is_correct,
         'confidence': 1.0 if is_correct else 0.0,
@@ -278,30 +486,15 @@ def get_model_metrics():
         df = pd.read_csv(ma_csv)
         ma = {}
         for _, row in df.iterrows():
-            model = row.get('model', row.get('strategy', 'unknown'))
-            if model in ('LR', 'SVM'):
-                ma[model.lower()] = {
-                    'accuracy':  float(row.get('accuracy', 0)),
-                    'precision': float(row.get('precision', 0)),
-                    'recall':    float(row.get('recall', 0)),
-                    'f1':        float(row.get('f1', 0)),
-                    '4way_acc':  float(row.get('4way_acc', 0)),
-                }
-        metrics['model_a'] = ma
-
-    ens_csv = os.path.join(reports_dir, 'model_a_ensemble_metrics.csv')
-    if os.path.exists(ens_csv):
-        ens_df = pd.read_csv(ens_csv)
-        if 'model_a' not in metrics:
-            metrics['model_a'] = {}
-        ens = {}
-        for _, row in ens_df.iterrows():
-            strat = str(row.get('strategy', ''))
-            ens[strat] = {
-                k: float(v) for k, v in row.items()
-                if k != 'strategy' and pd.notna(v)
+            model = row.get('model', 'nn')
+            ma[model.lower()] = {
+                'accuracy':  float(row.get('accuracy', 0)),
+                'precision': float(row.get('precision', 0)),
+                'recall':    float(row.get('recall', 0)),
+                'f1':        float(row.get('f1', 0)),
+                '4way_acc':  float(row.get('4way_acc', 0)),
             }
-        metrics['model_a']['ensemble'] = ens
+        metrics['model_a'] = ma
 
     cos_csv = os.path.join(reports_dir, 'model_a_cosine_retrieval_metrics.csv')
     if os.path.exists(cos_csv):

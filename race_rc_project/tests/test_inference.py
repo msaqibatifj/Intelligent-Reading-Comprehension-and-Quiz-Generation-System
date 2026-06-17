@@ -9,7 +9,12 @@ Run with:  python -m pytest tests/test_inference.py -v
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    _SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
+except NameError:
+    _SRC_DIR = os.path.join(os.getcwd(), 'src')
+sys.path.insert(0, os.path.normpath(_SRC_DIR))
 
 from preprocessing import (
     clean_text, tokenize, split_into_sentences,

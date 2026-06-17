@@ -15,11 +15,13 @@ import seaborn as sns
 import joblib
 
 # ── Path setup ────────────────────────────────────────────────────────────────
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+except NameError:
+    PROJECT_ROOT = os.getcwd()
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-
-from src.preprocessing import DATA_ROOT
 
 # ── Page configuration ────────────────────────────────────────────────────────
 st.set_page_config(
@@ -365,8 +367,6 @@ def init_state():
         'answers_given':  {},
         'hints_revealed': {},
         'session_log':    [],
-        'from_dataset':   False,
-        'dataset_split':  '',
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -514,7 +514,7 @@ def reset_quiz():
     st.session_state.update({
         'result': None, 'race_rows': None,
         'current_q_idx': 0, 'answers_given': {},
-        'hints_revealed': {}, 'from_dataset': False, 'dataset_split': '',
+        'hints_revealed': {},
     })
 
 
@@ -566,13 +566,6 @@ with st.sidebar:
         st.progress(n_done / max(len(qs), 1))
         st.caption(f"Current question: {idx + 1} of {len(qs)}")
 
-    if st.session_state.get('from_dataset'):
-        st.markdown("---")
-        split = st.session_state.get('dataset_split', 'test')
-        st.markdown(f'<div class="dataset-badge">📂 RACE {split.upper()} SET</div>',
-                    unsafe_allow_html=True)
-        st.caption("This passage is from the RACE evaluation split.")
-
     st.markdown("---")
     with st.expander("📚 Model details"):
         st.markdown("""
@@ -608,7 +601,7 @@ if nav == "📝  Article Input":
         value=st.session_state.get('article', ''),
         height=280,
         placeholder="Enter an English reading passage here…\n\n"
-                     "Tip: click 'Random from Dataset' to load a sample.",
+                     "Tip: paste your own passage to generate questions.",
         key='article_ta',
     )
     char_count = len(article_input)
@@ -654,93 +647,15 @@ if nav == "📝  Article Input":
                 "👉 Go to **🧠 Quiz** to start."
             )
 
-    # ── Below: RACE Dataset + Preview ───────────────────────────────────────────
-    col_ds, col_prev = st.columns(2, gap="large")
-
-    with col_ds:
-        # Load from RACE dataset
-        st.markdown('<div class="card card-teal">', unsafe_allow_html=True)
-        st.markdown("#### 🗂️ Load from RACE Dataset")
-        st.caption("Use a real passage from the RACE test/train split for authentic evaluation.")
-
-        # Prefer test_clean.csv → race.csv → train.csv
-        data_dir = DATA_ROOT
-        dataset_options = [
-            (os.path.join(data_dir, 'processed', 'test_clean.csv'),  'test',  '🔬 Test Split'),
-            (os.path.join(data_dir, 'processed', 'train_clean.csv'), 'train', '📚 Train Split'),
-            (os.path.join(data_dir, 'raw', 'race.csv'),              'race',  '📦 race.csv'),
-        ]
-
-        available = [(p, sp, lbl) for p, sp, lbl in dataset_options if os.path.exists(p)]
-        if available:
-            path, split, lbl = available[0]
-            st.markdown(f'<div class="dataset-badge">{lbl}</div>', unsafe_allow_html=True)
-            if st.button("🎲  Random Passage from Dataset", use_container_width=True,
-                         type="secondary"):
-                try:
-                    nrows = None if 'clean' in path else 8000
-                    df_r = pd.read_csv(path, nrows=nrows)
-                    df_r.columns = [c.strip() for c in df_r.columns]
-                    df_r = df_r.dropna(subset=['article','question','answer'])
-                    df_r = df_r[df_r['answer'].isin(['A','B','C','D'])]
-
-                    id_counts = df_r['id'].value_counts()
-                    good_ids  = id_counts[id_counts >= 2].index.tolist()
-                    chosen    = random.choice(good_ids) if good_ids else df_r['id'].iloc[0]
-
-                    rows = df_r[df_r['id'] == chosen].head(5)
-                    art  = str(rows.iloc[0]['article'])
-                    rr   = rows.to_dict('records')
-
-                    reset_quiz()
-                    st.session_state['article']      = art
-                    st.session_state['race_rows']    = rr
-                    st.session_state['from_dataset'] = True
-                    st.session_state['dataset_split'] = split
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not load dataset: {e}")
-
-            # Show other available splits
-            for p2, sp2, lbl2 in available[1:]:
-                if st.button(f"Load from {lbl2}", use_container_width=True, key=f"ds_{sp2}"):
-                    try:
-                        nrows = None if 'clean' in p2 else 8000
-                        df_r = pd.read_csv(p2, nrows=nrows)
-                        df_r.columns = [c.strip() for c in df_r.columns]
-                        df_r = df_r.dropna(subset=['article','question','answer'])
-                        df_r = df_r[df_r['answer'].isin(['A','B','C','D'])]
-                        id_counts = df_r['id'].value_counts()
-                        good_ids  = id_counts[id_counts >= 2].index.tolist()
-                        chosen    = random.choice(good_ids) if good_ids else df_r['id'].iloc[0]
-                        rows = df_r[df_r['id'] == chosen].head(5)
-                        reset_quiz()
-                        st.session_state['article']       = str(rows.iloc[0]['article'])
-                        st.session_state['race_rows']     = rows.to_dict('records')
-                        st.session_state['from_dataset']  = True
-                        st.session_state['dataset_split'] = sp2
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        else:
-            st.info(
-                f"No dataset found. Run training first or place CSVs under {os.path.join(DATA_ROOT, 'raw')}."
-            )
-
+    # ── Passage Preview ────────────────────────────────────────────────────────
+    article_now = st.session_state.get('article', '')
+    if article_now:
+        st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
+        st.markdown("#### 👁️ Passage Preview")
+        preview = article_now[:2000] + ('…' if len(article_now) > 2000 else '')
+        st.markdown(f'<div class="article-preview">{preview}</div>',
+                    unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_prev:
-        article_now = st.session_state.get('article', '')
-        if article_now:
-            st.markdown('<div class="card card-amber">', unsafe_allow_html=True)
-            st.markdown("#### 👁️ Passage Preview")
-            preview = article_now[:2000] + ('…' if len(article_now) > 2000 else '')
-            st.markdown(f'<div class="article-preview">{preview}</div>',
-                        unsafe_allow_html=True)
-            if st.session_state.get('from_dataset'):
-                rr = st.session_state.get('race_rows', [])
-                st.caption(f"📌 {len(rr)} RACE question(s) available for this passage")
-            st.markdown('</div>', unsafe_allow_html=True)
 
     # Preview first question if quiz already generated
     if st.session_state.get('result'):
@@ -887,14 +802,6 @@ elif nav == "🧠  Quiz":
                     st.markdown(f'<div class="article-preview">{preview}</div>',
                                 unsafe_allow_html=True)
                     st.markdown('</div>', unsafe_allow_html=True)
-
-                if st.session_state.get('from_dataset'):
-                    st.markdown(
-                        f'<div class="dataset-badge">📂 RACE '
-                        f'{st.session_state.get("dataset_split","").upper()} SET</div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.caption("Questions sourced directly from the RACE dataset.")
 
                 # Quick nav tiles
                 st.markdown('<div class="card card-indigo">', unsafe_allow_html=True)
