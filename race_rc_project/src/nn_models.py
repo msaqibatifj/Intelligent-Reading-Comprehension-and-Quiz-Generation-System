@@ -552,8 +552,9 @@ def train_transformer(
     checkpoint_dir: str | Path = "./checkpoints",
     resume_from_checkpoint: str | Path | None = None,
     verbose: bool = True,
+    accumulation_steps: int = 3,
 ):
-    """Training loop for TransformerAnswerVerifier with early stopping."""
+    """Training loop for TransformerAnswerVerifier with gradient accumulation and early stopping."""
     device = DEVICE
     model = model.to(device)
     n_gpus = max(torch.cuda.device_count(), 1)
@@ -581,6 +582,7 @@ def train_transformer(
     best_state = None
     stall = 0
     n_batches = len(train_ld)
+    accum_steps = max(1, accumulation_steps)
 
     if resume_from_checkpoint is not None:
         start_epoch, best_loss, best_state, stall = _load_training_checkpoint(
@@ -603,21 +605,27 @@ def train_transformer(
         model.train()
         tr_loss = 0.0
         pbar = tqdm(train_ld, total=n_batches, desc=f"  epoch {epoch}/{epochs}", unit="batch", leave=False)
-        for batch in pbar:
+
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(pbar, 1):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            optimizer.zero_grad()
             if use_amp:
                 with autocast("cuda"):
                     out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                scaler.scale(out.loss.mean()).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(out.loss.mean() / accum_steps).backward()
+                if step % accum_steps == 0 or step == n_batches:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
             else:
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                out.loss.mean().backward()
-                optimizer.step()
+                (out.loss.mean() / accum_steps).backward()
+                if step % accum_steps == 0 or step == n_batches:
+                    optimizer.step()
+                    optimizer.zero_grad()
             tr_loss += out.loss.mean().item() * input_ids.size(0)
             pbar.set_postfix(loss=f"{out.loss.mean().item():.4f}")
         scheduler.step()
@@ -847,22 +855,38 @@ def train_seq2seq(
     checkpoint_dir: str | Path = "./checkpoints",
     resume_from_checkpoint: str | Path | None = None,
     verbose: bool = True,
+    accumulation_steps: int = 3,
 ):
     """
-    Training loop for seq2seq models (QuestionGenerator / DistractorGenerator).
+    Training loop for seq2seq models (QuestionGenerator / DistractorGenerator)
+    with gradient accumulation, DDP support, and bfloat16 AMP.
+
     Each input is raw text; each target is the expected output text.
 
-    `model` may be wrapped with DataParallel and/or torch.compile by the caller
-    (transformer_train.py).  We unwrap here to safely access .tokenizer,
-    .max_input_length, and .max_output_length before the training loop begins.
+    ``model`` may be wrapped with DDP and/or torch.compile by the caller.
+    We unwrap here to safely access .tokenizer, .max_input_length, and
+    .max_output_length before the training loop begins.
+
+    Parameters
+    ----------
+    accumulation_steps :
+        Number of micro-batches to accumulate before each optimizer step.
+        Reduces the effective batch-size footprint in VRAM.
+        The effective batch size = ``batch_size * accumulation_steps``.
     """
     device = DEVICE
     model = model.to(device)
 
+    # ── DDP helpers ─────────────────────────────────────────────────────────
+    try:
+        import torch.distributed as dist
+        _is_ddp = dist.is_initialized() and dist.get_world_size() > 1
+    except Exception:
+        _is_ddp = False
+
     # ── Unwrap to access custom attributes safely ───────────────────────────
-    # After _wrap_dataparallel() and _try_compile() in transformer_train.py,
-    # `model` may be:
-    #   OptimizedModule(_orig_mod=DataParallel(module=QuestionGenerator(...)))
+    # After _wrap_ddp() and _try_compile() in transformer_train.py, `model` may
+    # be OptimizedModule(_orig_mod=DDP(module=QuestionGenerator(...))).
     # _unwrap_model() peels all layers to reach the original QuestionGenerator.
     base_model = _unwrap_model(model)
     tokenizer = base_model.tokenizer
@@ -914,13 +938,16 @@ def train_seq2seq(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = GradScaler("cuda") if device.type == "cuda" else None
-    use_amp = scaler is not None
 
     start_epoch = 1
     best_loss = float("inf")
     best_state = None
     stall = 0
     n_batches = len(train_ld)
+    accum_steps = max(1, accumulation_steps)
+    accum_batches = n_batches  # for logging only
+    if _is_ddp:
+        accum_batches = n_batches * dist.get_world_size()
 
     if resume_from_checkpoint is not None:
         start_epoch, best_loss, best_state, stall = _load_training_checkpoint(
@@ -942,25 +969,38 @@ def train_seq2seq(
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         tr_loss = 0.0
+        tr_samples = 0
         pbar = tqdm(train_ld, total=n_batches, desc=f"  epoch {epoch}/{epochs}", unit="batch", leave=False)
-        for batch in pbar:
+
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(pbar, 1):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            optimizer.zero_grad()
-            if use_amp:
-                with autocast("cuda"):
-                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                scaler.scale(out.loss.mean()).backward()
+
+            with autocast("cuda", dtype=torch.float16):
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = out.loss.mean() / accum_steps
+            scaler.scale(loss).backward()
+
+            tr_loss += out.loss.mean().item() * input_ids.size(0)
+            tr_samples += input_ids.size(0)
+
+            if step % accum_steps == 0 or step == n_batches:
                 scaler.step(optimizer)
                 scaler.update()
-            else:
-                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                out.loss.mean().backward()
-                optimizer.step()
-            tr_loss += out.loss.mean().item() * input_ids.size(0)
-            pbar.set_postfix(loss=f"{out.loss.mean().item():.4f}")
-        tr_loss /= len(train_ld.dataset)
+                optimizer.zero_grad()
+
+            pbar.set_postfix(loss=f"{out.loss.mean().item():.4f}", accum_step=step // accum_steps)
+
+        # Flush any remaining gradients
+        if n_batches % accum_steps != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        tr_loss /= max(tr_samples, 1)
         scheduler.step()
 
         if val_data is not None:
@@ -968,14 +1008,7 @@ def train_seq2seq(
             val_enc, val_lbl = val_data
             val_loss = 0.0
             with torch.no_grad():
-                if use_amp:
-                    with autocast("cuda"):
-                        out = model(
-                            input_ids=val_enc.input_ids.to(device, non_blocking=True),
-                            attention_mask=val_enc.attention_mask.to(device, non_blocking=True),
-                            labels=val_lbl.to(device, non_blocking=True),
-                        )
-                else:
+                with autocast("cuda", dtype=torch.float16):
                     out = model(
                         input_ids=val_enc.input_ids.to(device, non_blocking=True),
                         attention_mask=val_enc.attention_mask.to(device, non_blocking=True),
@@ -986,7 +1019,7 @@ def train_seq2seq(
                 tqdm.write(f"  epoch {epoch:2d}/{epochs}  tr_loss={tr_loss:.4f}  val_loss={val_loss:.4f}")
             if val_loss < best_loss:
                 best_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_state = {k: v.cpu().clone() for k, v in _unwrap_model(model).state_dict().items()}
                 stall = 0
             else:
                 stall += 1
@@ -1004,7 +1037,7 @@ def train_seq2seq(
                 best_loss=best_loss,
                 best_state=best_state,
                 stall=stall,
-                extra_meta={"trainer": "seq2seq", "epoch": epoch},
+                extra_meta={"trainer": "seq2seq", "epoch": epoch, "accumulation_steps": accum_steps},
             )
 
         if val_data is not None and stall >= patience:

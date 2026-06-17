@@ -1,11 +1,15 @@
 """
 transformer_train.py — Training pipelines for transformer-based MCQ models
-Optimized for dual T4 GPUs on Kaggle with maximum throughput.
+Optimized for dual-GPU DDP on Kaggle with maximum throughput.
 
 Three sub-pipelines:
   1. TransformerAnswerVerifier  (BERT)   — score P(correct) for (article, question, option)
   2. QuestionGenerator          (T5)     — generate question from (context, answer)
   3. DistractorGenerator        (BART)   — generate distractors from (question, correct)
+
+Launch with torchrun for multi-GPU::
+
+    torchrun --nproc_per_node=N src/transformer_train.py --csv data/raw/train.csv
 """
 
 from __future__ import annotations
@@ -20,6 +24,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+
+from ddp_utils import (
+    init_ddp,
+    destroy_ddp,
+    is_main_process,
+    is_ddp,
+    get_rank,
+    get_world_size,
+)
 
 # from src.nn_models import (
 #     DEVICE,
@@ -43,26 +57,33 @@ os.makedirs(_MODEL_A_DIR, exist_ok=True)
 os.makedirs(_MODEL_B_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# GPU / hardware setup
+# GPU / hardware setup  (DDP-aware)
 # ---------------------------------------------------------------------------
 
 def _setup_gpus() -> Tuple[torch.device, int]:
     """
-    Detect available GPUs and return (primary_device, gpu_count).
-    Prints a summary so Kaggle logs show what hardware is being used.
+    Detect available GPUs, initialise DDP (if launched via torchrun),
+    and return (primary_device, gpu_count).
+
+    When torchrun is used, LOCAL_RANK and WORLD_SIZE are picked up by
+    ``init_ddp()`` and the device is set to ``cuda:LOCAL_RANK``.
+    When running without torchrun, we fall back to a single-GPU setup.
     """
-    n_gpus = torch.cuda.device_count()
-    if n_gpus == 0:
-        print("[GPU] No CUDA devices found — running on CPU.")
-        return torch.device("cpu"), 0
+    rank, world_size, device = init_ddp()
 
-    print(f"[GPU] {n_gpus} CUDA device(s) detected:")
-    for i in range(n_gpus):
-        props = torch.cuda.get_device_properties(i)
-        print(f"       GPU {i}: {props.name}  |  {props.total_memory // 1024**3} GB VRAM")
-
-    # Pin computation to GPU 0; DataParallel scatters across all visible GPUs.
-    device = torch.device("cuda:0")
+    if world_size <= 1:
+        n_gpus = torch.cuda.device_count()
+        if n_gpus == 0:
+            print("[GPU] No CUDA devices found — running on CPU.")
+            return torch.device("cpu"), 0
+        print(f"[GPU] {n_gpus} CUDA device(s) detected (single-process).")
+        for i in range(n_gpus):
+            props = torch.cuda.get_device_properties(i)
+            print(f"       GPU {i}: {props.name}  |  {props.total_memory // 1024**3} GB VRAM")
+    else:
+        n_gpus = world_size
+        props = torch.cuda.get_device_properties(rank)
+        print(f"[GPU] Rank {rank}/{world_size} — {props.name}  |  {props.total_memory // 1024**3} GB VRAM")
 
     # cuDNN autotuner — big win for fixed input sizes (BERT, T5, BART encoders).
     torch.backends.cudnn.benchmark = True
@@ -76,15 +97,21 @@ def _setup_gpus() -> Tuple[torch.device, int]:
 DEVICE, N_GPUS = _setup_gpus()
 
 
-def _wrap_dataparallel(model: nn.Module) -> nn.Module:
+def _wrap_ddp(model: nn.Module) -> nn.Module:
     """
-    Wrap model with DataParallel when multiple GPUs are available.
-    DataParallel is simpler than DDP for a single-process Kaggle notebook
-    and requires zero changes to the training loop.
+    Wrap model with DistributedDataParallel when running under torchrun.
+    Uses ``find_unused_parameters=False`` by default for seq2seq models
+    where all parameters receive gradient.
     """
-    if N_GPUS > 1:
-        print(f"[GPU] Wrapping model with DataParallel across {N_GPUS} GPUs.")
-        model = nn.DataParallel(model)
+    if is_ddp():
+        rank = get_rank()
+        print(f"[GPU] Rank {rank}: wrapping model with DDP.")
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False,
+        )
     return model.to(DEVICE)
 
 
@@ -92,11 +119,15 @@ def _try_compile(model: nn.Module) -> nn.Module:
     """
     Attempt torch.compile (PyTorch ≥ 2.0).  Falls back gracefully on older
     versions or unsupported backends (e.g. Windows / CPU-only builds).
+
+    On T4 (no bfloat16 hardware) ``mode="default"`` triggers repeated inductor
+    warnings and first-epoch slowdown, so we use ``mode="reduce-overhead"``,
+    which applies a lightweight CUDA graph capture instead.
     """
-    if hasattr(torch, "compile") and N_GPUS > 0:
+    if hasattr(torch, "compile") and torch.cuda.is_available():
         try:
-            model = torch.compile(model, mode="default")
-            print("[Speed] torch.compile() applied (default mode).")
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[Speed] torch.compile() applied (reduce-overhead mode).")
         except Exception as e:
             print(f"[Speed] torch.compile() skipped: {e}")
     return model
@@ -104,6 +135,65 @@ def _try_compile(model: nn.Module) -> nn.Module:
 
 # DataLoader performance flags are set directly in nn_models.py
 # (train_transformer and train_seq2seq) to avoid monkey-patch issues.
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint management
+# ---------------------------------------------------------------------------
+
+def _cleanup_old_checkpoints(checkpoint_dir: Path, keep_last: int = 5):
+    """
+    Remove old epoch checkpoints, keeping only the ``keep_last`` most recent.
+    Preserves ``latest.ckpt``, ``best.ckpt``, and non-epoch files.
+    """
+    if not checkpoint_dir.exists():
+        return
+    epoch_ckpts = sorted(
+        checkpoint_dir.glob("epoch_*.ckpt"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    n_remove = max(0, len(epoch_ckpts) - keep_last)
+    for old in epoch_ckpts[:n_remove]:
+        old.unlink(missing_ok=True)
+        print(f"  checkpoint cleanup: removed {old.name}")
+
+
+def _save_best_checkpoint(
+    checkpoint_dir: Path,
+    model: nn.Module,
+    val_loss: float,
+    epoch: int,
+    extra_meta: Optional[dict] = None,
+):
+    """Save a best-so-far checkpoint that won't be rotated away."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    from nn_models import _unwrap_model
+    payload = {
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "model_state_dict": _unwrap_model(model).state_dict(),
+        "meta": extra_meta or {},
+    }
+    best_path = checkpoint_dir / "best.ckpt"
+    torch.save(payload, best_path)
+    print(f"  best checkpoint updated → {best_path}  (val_loss={val_loss:.4f})")
+
+
+def _verify_checkpoint(checkpoint_path: Path) -> bool:
+    """
+    Quick integrity check: can the file be loaded and does it contain
+    expected keys?
+    """
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        required = {"epoch", "model_state_dict", "optimizer_state_dict", "best_loss"}
+        if required.issubset(ckpt.keys()):
+            return True
+        print(f"  WARNING: {checkpoint_path} is missing keys: {required - ckpt.keys()}")
+        return False
+    except Exception as e:
+        print(f"  WARNING: {checkpoint_path} appears corrupt: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +313,7 @@ def train_answer_verifier_transformer(
     max_rows: Optional[int] = None,
     checkpoint_dir: Optional[Path] = None,
     resume_from_checkpoint: Optional[Path] = None,
+    max_checkpoints: int = 5,
 ):
     """Train a BERT-based answer verifier on MCQ data (dual-GPU optimized)."""
     print("[TransformerAV] preparing data …")
@@ -245,12 +336,17 @@ def train_answer_verifier_transformer(
     )
 
     model = _try_compile(model)
-    model = _wrap_dataparallel(model)
+    model = _wrap_ddp(model)
+
+    ckpt_dir = checkpoint_dir or (_MODEL_A_DIR / "checkpoints")
+    if is_main_process():
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[TransformerAV] checkpoints → {ckpt_dir}  (max per epoch: {max_checkpoints})")
 
     print(f"[TransformerAV] tokenizing {len(train_texts):,} train"
           f" + {len(val_texts) if val_texts else 0:,} val texts "
           f"(max_length={max_length}) …")
-    # fp16/AMP is handled automatically inside train_transformer via GradScaler.
+    # AMP is handled automatically inside train_transformer via GradScaler.
     model = train_transformer(
         model=model,
         tokenizer=tokenizer,
@@ -263,18 +359,28 @@ def train_answer_verifier_transformer(
         lr=lr,
         patience=2,
         max_length=max_length,
-        checkpoint_dir=checkpoint_dir or (_MODEL_A_DIR / "checkpoints"),
+        checkpoint_dir=ckpt_dir,
         resume_from_checkpoint=resume_from_checkpoint,
     )
 
-    # Save — unwrap DataParallel before persisting state_dict so the checkpoint
-    # is portable (loadable on a single-GPU or CPU machine without DataParallel).
-    path = _MODEL_A_DIR / "answer_verifier_transformer.pt"
-    state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-    torch.save(state, path)
-    with open(_MODEL_A_DIR / "transformer_meta.json", "w") as f:
-        json.dump({"model_name": model_name, "type": "answer_verifier"}, f)
-    print(f"[TransformerAV] saved → {path}")
+    # Post-training: cleanup old checkpoints and verify integrity
+    if is_main_process():
+        _cleanup_old_checkpoints(ckpt_dir, keep_last=max_checkpoints)
+        latest = ckpt_dir / "latest.ckpt"
+        if latest.exists():
+            ok = _verify_checkpoint(latest)
+            print(f"[TransformerAV] latest checkpoint integrity: {'OK' if ok else 'CORRUPT'}")
+
+    # Save — unwrap DDP/compile before persisting state_dict so the checkpoint
+    # is portable (loadable on a single-GPU or CPU machine without DDP).
+    if is_main_process():
+        from nn_models import _unwrap_model
+        path = _MODEL_A_DIR / "answer_verifier_transformer.pt"
+        state = _unwrap_model(model).state_dict()
+        torch.save(state, path)
+        with open(_MODEL_A_DIR / "transformer_meta.json", "w") as f:
+            json.dump({"model_name": model_name, "type": "answer_verifier"}, f)
+        print(f"[TransformerAV] saved → {path}")
     return model
 
 
@@ -283,7 +389,7 @@ def train_question_generator(
     model_name: str = "google/flan-t5-base",
     epochs: int = 5,
     # Seq2seq models are decoder-heavy; keep per-GPU batch modest.
-    batch_size: int = 4,
+    batch_size: int = 12,
     lr: float = 3e-5,
     use_lora: bool = True,
     lora_r: int = 8,
@@ -291,13 +397,24 @@ def train_question_generator(
     max_rows: Optional[int] = None,
     checkpoint_dir: Optional[Path] = None,
     resume_from_checkpoint: Optional[Path] = None,
+    max_checkpoints: int = 5,
 ):
-    """Train a T5/FLAN-T5 question generator (dual-GPU optimized)."""
+    """Train a T5/FLAN-T5 question generator (dual-GPU optimized).
+
+    Per-epoch checkpoints are saved to ``checkpoint_dir`` (default:
+    ``models/model_b/transformer/checkpoints/``). Resume by passing
+    ``resume_from_checkpoint=<path>/latest.ckpt``.
+    """
     print("[QG] preparing data …")
     inputs, targets = prepare_question_generation_data(df, max_rows)
     split = int(len(inputs) * 0.9)
     tr_in, tr_tg = inputs[:split], targets[:split]
     val_in, val_tg = (inputs[split:], targets[split:]) if split < len(inputs) else (None, None)
+
+    ckpt_dir = checkpoint_dir or (_MODEL_B_DIR / "checkpoints")
+    if is_main_process():
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[QG] per-epoch checkpoints → {ckpt_dir}  (max per epoch: {max_checkpoints})")
 
     print(f"[QG] training {model_name}  |  train={len(tr_in):,}  val={len(val_in) if val_in else 0:,}")
     torch.cuda.empty_cache()
@@ -308,9 +425,8 @@ def train_question_generator(
     )
 
     model = _try_compile(model)
-    model = _wrap_dataparallel(model)
+    model = _wrap_ddp(model)
 
-    # fp16/AMP handled internally via GradScaler inside train_seq2seq.
     model = train_seq2seq(
         model=model,
         train_inputs=tr_in,
@@ -321,16 +437,27 @@ def train_question_generator(
         batch_size=batch_size,
         lr=lr,
         patience=2,
-        checkpoint_dir=checkpoint_dir or (_MODEL_B_DIR / "checkpoints"),
+        checkpoint_dir=ckpt_dir,
         resume_from_checkpoint=resume_from_checkpoint,
+        accumulation_steps=4,
     )
 
-    path = _MODEL_B_DIR / "question_generator.pt"
-    state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-    torch.save(state, path)
-    with open(_MODEL_B_DIR / "qg_meta.json", "w") as f:
-        json.dump({"model_name": model_name, "type": "question_generator"}, f)
-    print(f"[QG] saved → {path}")
+    # Post-training: cleanup old checkpoints and verify integrity
+    if is_main_process():
+        _cleanup_old_checkpoints(ckpt_dir, keep_last=max_checkpoints)
+        latest = ckpt_dir / "latest.ckpt"
+        if latest.exists():
+            ok = _verify_checkpoint(latest)
+            print(f"[QG] latest checkpoint integrity: {'OK' if ok else 'CORRUPT'}")
+
+    if is_main_process():
+        from nn_models import _unwrap_model
+        path = _MODEL_B_DIR / "question_generator.pt"
+        state = _unwrap_model(model).state_dict()
+        torch.save(state, path)
+        with open(_MODEL_B_DIR / "qg_meta.json", "w") as f:
+            json.dump({"model_name": model_name, "type": "question_generator"}, f)
+        print(f"[QG] saved → {path}")
     return model
 
 
@@ -338,7 +465,7 @@ def train_distractor_generator(
     df: pd.DataFrame,
     model_name: str = "facebook/bart-base",
     epochs: int = 5,
-    batch_size: int = 4,
+    batch_size: int = 12,
     lr: float = 3e-5,
     use_lora: bool = True,
     lora_r: int = 8,
@@ -346,6 +473,7 @@ def train_distractor_generator(
     max_rows: Optional[int] = None,
     checkpoint_dir: Optional[Path] = None,
     resume_from_checkpoint: Optional[Path] = None,
+    max_checkpoints: int = 5,
 ):
     """Train a BART/T5 distractor generator (dual-GPU optimized)."""
     print("[DG] preparing data …")
@@ -353,6 +481,11 @@ def train_distractor_generator(
     split = int(len(inputs) * 0.9)
     tr_in, tr_tg = inputs[:split], targets[:split]
     val_in, val_tg = (inputs[split:], targets[split:]) if split < len(inputs) else (None, None)
+
+    ckpt_dir = checkpoint_dir or (_MODEL_B_DIR / "checkpoints")
+    if is_main_process():
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[DG] per-epoch checkpoints → {ckpt_dir}  (max kept: {max_checkpoints})")
 
     print(f"[DG] training {model_name}  |  train={len(tr_in):,}  val={len(val_in) if val_in else 0:,}")
     torch.cuda.empty_cache()
@@ -363,7 +496,7 @@ def train_distractor_generator(
     )
 
     model = _try_compile(model)
-    model = _wrap_dataparallel(model)
+    model = _wrap_ddp(model)
 
     model = train_seq2seq(
         model=model,
@@ -375,16 +508,27 @@ def train_distractor_generator(
         batch_size=batch_size,
         lr=lr,
         patience=2,
-        checkpoint_dir=checkpoint_dir or (_MODEL_B_DIR / "checkpoints"),
+        checkpoint_dir=ckpt_dir,
         resume_from_checkpoint=resume_from_checkpoint,
+        accumulation_steps=4,
     )
 
-    path = _MODEL_B_DIR / "distractor_generator.pt"
-    state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-    torch.save(state, path)
-    with open(_MODEL_B_DIR / "dg_meta.json", "w") as f:
-        json.dump({"model_name": model_name, "type": "distractor_generator"}, f)
-    print(f"[DG] saved → {path}")
+    # Post-training: cleanup old checkpoints and verify integrity
+    if is_main_process():
+        _cleanup_old_checkpoints(ckpt_dir, keep_last=max_checkpoints)
+        latest = ckpt_dir / "latest.ckpt"
+        if latest.exists():
+            ok = _verify_checkpoint(latest)
+            print(f"[DG] latest checkpoint integrity: {'OK' if ok else 'CORRUPT'}")
+
+    if is_main_process():
+        from nn_models import _unwrap_model
+        path = _MODEL_B_DIR / "distractor_generator.pt"
+        state = _unwrap_model(model).state_dict()
+        torch.save(state, path)
+        with open(_MODEL_B_DIR / "dg_meta.json", "w") as f:
+            json.dump({"model_name": model_name, "type": "distractor_generator"}, f)
+        print(f"[DG] saved → {path}")
     return model
 
 
@@ -405,6 +549,7 @@ def run_all(
     av_resume_from: Optional[str] = None,
     qg_resume_from: Optional[str] = None,
     dg_resume_from: Optional[str] = None,
+    max_checkpoints: int = 5,
 ):
     """End-to-end training of all three transformer models."""
     # Load data
@@ -431,6 +576,7 @@ def run_all(
     #     fp16=fp16,
     #     max_rows=max_rows,
     #     resume_from_checkpoint=Path(av_resume_from) if av_resume_from else None,
+    #     max_checkpoints=max_checkpoints,
     # )
 
     torch.cuda.empty_cache()
@@ -445,6 +591,7 @@ def run_all(
         fp16=fp16,
         max_rows=max_rows,
         resume_from_checkpoint=Path(qg_resume_from) if qg_resume_from else None,
+        max_checkpoints=max_checkpoints,
     )
 
     torch.cuda.empty_cache()
@@ -459,6 +606,7 @@ def run_all(
         fp16=fp16,
         max_rows=max_rows,
         resume_from_checkpoint=Path(dg_resume_from) if dg_resume_from else None,
+        max_checkpoints=max_checkpoints,
     )
 
     torch.cuda.empty_cache()
@@ -491,6 +639,8 @@ if __name__ == "__main__":
                         help="Path to a transformer checkpoint to resume question-generator training")
     parser.add_argument("--dg-resume-from", default=None,
                         help="Path to a transformer checkpoint to resume distractor-generator training")
+    parser.add_argument("--max-checkpoints", type=int, default=5,
+                        help="Maximum number of epoch checkpoints to keep (default: 5)")
     args, _ = parser.parse_known_args()
     run_all(
         csv_path=args.csv,
@@ -505,4 +655,5 @@ if __name__ == "__main__":
         av_resume_from=args.av_resume_from,
         qg_resume_from=args.qg_resume_from,
         dg_resume_from=args.dg_resume_from,
+        max_checkpoints=args.max_checkpoints,
     )
